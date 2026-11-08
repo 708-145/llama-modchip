@@ -242,6 +242,12 @@ def detect_memory_and_thp():
             mem["shm_total_gb"] = (st.f_blocks * st.f_frsize) / (1024.0 ** 3)
         except Exception:
             pass
+
+        # Handle un-capped LXC / container cgroups that report 1 PiB (1048576 GiB) MemTotal
+        if mem["total_gb"] > 65536.0 and mem["shm_total_gb"] > 0.5:
+            # If /dev/shm was resized to ~100% of host RAM via --apply-shm (or default 50%)
+            mem["total_gb"] = mem["shm_total_gb"] if mem["shm_total_gb"] >= 24.0 else mem["shm_total_gb"] * 2.0
+            mem["available_gb"] = min(mem["available_gb"], mem["total_gb"] * 0.85)
     elif platform.system() == "Darwin":
         tot = run_cmd("sysctl -n hw.memsize")
         if tot.isdigit():
@@ -253,71 +259,92 @@ def detect_memory_and_thp():
 
 
 # ============================================================================
-# 2. Multi-Core Sustained DRAM Bandwidth Micro-Benchmark (Zero-Dependency)
+# 2. Multi-Core Sustained DRAM Read Bandwidth Micro-Benchmark (Zero-Dependency)
 # ============================================================================
 
+_BW_READY = None
+_BW_START_EVT = None
+
+
+def _bw_pool_init(ready_val, start_evt):
+    global _BW_READY, _BW_START_EVT
+    _BW_READY = ready_val
+    _BW_START_EVT = start_evt
+
+
 def _bw_worker(args):
-    buf_mb, iters, start_evt = args
+    buf_mb, iters = args
     size = buf_mb * 1024 * 1024
     libc_name = ctypes.util.find_library("c")
     libc = ctypes.CDLL(libc_name) if libc_name else None
 
-    # Allocate anonymous mmap buffers and fault pages in
+    # Allocate anonymous mmap buffer and fault all pages in BEFORE barrier
     src = mmap.mmap(-1, size)
-    dst = mmap.mmap(-1, size)
 
     if libc:
         src_ptr = ctypes.addressof(ctypes.c_char.from_buffer(src))
-        dst_ptr = ctypes.addressof(ctypes.c_char.from_buffer(dst))
         libc.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-        libc.memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        libc.memchr.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        libc.memchr.restype = ctypes.c_void_p
         libc.memset(src_ptr, 0x5A, size)
-        libc.memset(dst_ptr, 0xA5, size)
     else:
         src[:] = b"\x5a" * size
-        dst[:] = b"\xa5" * size
 
-    start_evt.wait()
+    if _BW_READY is not None:
+        with _BW_READY.get_lock():
+            _BW_READY.value += 1
+    if _BW_START_EVT is not None:
+        _BW_START_EVT.wait()
+
     t0 = time.perf_counter()
     if libc:
+        # Pure SIMD DRAM Read scan (AVX-512 / AVX2 / NEON in glibc memchr):
+        # Avoids the 2:1 Infinity Fabric GMI3 write-throttling penalty on 2-CCD Ryzen CPUs
         for _ in range(iters):
-            libc.memcpy(dst_ptr, src_ptr, size)
-            # Touch 1 byte to prevent dead-store optimization
-            libc.memset(dst_ptr, _ & 0xFF, 64)
+            libc.memchr(src_ptr, 0xFF, size)
     else:
         for _ in range(iters):
-            dst[:] = src[:]
+            src.find(b"\xff")
     elapsed = time.perf_counter() - t0
     src.close()
-    dst.close()
-    # Each memcpy moves `size` bytes (read src + write dst = 2 * size DRAM traffic)
-    bytes_transferred = 2.0 * size * iters
-    return bytes_transferred, elapsed
+    bytes_read = float(size) * iters
+    return bytes_read, elapsed
 
 
 def measure_dram_bandwidth_gbs(physical_cores, total_ram_gb):
-    # Use up to 16 workers, 128 MB per worker (2x 128 MB = 256 MB per worker)
+    # Use up to 16 workers, 128 MB per worker (pure SIMD read stream after page-fault barrier)
     n_workers = min(max(1, physical_cores), 16)
     buf_mb = 64 if total_ram_gb < 16 else 128
-    iters = 4
+    iters = 6
 
     try:
-        ctx = multiprocessing.get_context("fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn")
-        mgr = ctx.Manager()
-        evt = mgr.Event()
-        pool = ctx.Pool(processes=n_workers)
-        async_res = [pool.apply_async(_bw_worker, ((buf_mb, iters, evt),)) for _ in range(n_workers)]
-        time.sleep(0.08)
-        t0 = time.perf_counter()
-        evt.set()
-        results = [r.get(timeout=10) for r in async_res]
-        wall_time = time.perf_counter() - t0
-        pool.close()
-        pool.join()
+        if "fork" in multiprocessing.get_all_start_methods():
+            ctx = multiprocessing.get_context("fork")
+            ready = ctx.Value("i", 0)
+            evt = ctx.Event()
+            pool = ctx.Pool(processes=n_workers, initializer=_bw_pool_init, initargs=(ready, evt))
+            async_res = [pool.apply_async(_bw_worker, ((buf_mb, iters),)) for _ in range(n_workers)]
+            t_wait0 = time.perf_counter()
+            while ready.value < n_workers and (time.perf_counter() - t_wait0) < 4.0:
+                time.sleep(0.005)
+            t0 = time.perf_counter()
+            evt.set()
+            results = [r.get(timeout=10) for r in async_res]
+            wall_time = time.perf_counter() - t0
+            pool.close()
+            pool.join()
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            pool = ctx.Pool(processes=n_workers)
+            t0 = time.perf_counter()
+            results = pool.map(_bw_worker, [(buf_mb, iters) for _ in range(n_workers)])
+            wall_time = time.perf_counter() - t0
+            pool.close()
+            pool.join()
 
         total_bytes = sum(b for b, _ in results)
         max_worker_time = max(t for _, t in results)
-        eff_time = max(max_worker_time, wall_time * 0.85, 1e-4)
+        eff_time = max(max_worker_time, wall_time * 0.90, 1e-4)
         return (total_bytes / 1e9) / eff_time
     except Exception:
         return 0.0
@@ -353,26 +380,22 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
         prefill_compute_mult = 0.85
     elif has_avx_vnni or has_avx2:
         simd_tier = "AVX2" + (" + AVX-VNNI" if has_avx_vnni else " (No AVX-512 VNNI)")
-        decode_compute_mult = 0.68 if has_avx_vnni else 0.56
-        prefill_compute_mult = 0.58 if has_avx_vnni else 0.45
+        # On 16-24+ core AVX2 systems (e.g. 24-core EPYC 7402P with 8-channel DDR4),
+        # aggregate AVX2 vpmaddwd throughput across cores saturates memory bandwidth
+        many_core_bonus = min(1.0, 0.78 + 0.012 * max(0, cpu["physical_cores"] - 8))
+        decode_compute_mult = 0.88 if has_avx_vnni else many_core_bonus
+        prefill_compute_mult = 0.72 if has_avx_vnni else (0.58 if cpu["physical_cores"] < 20 else 0.68)
     elif has_arm_neon:
         simd_tier = "ARM64 NEON / Apple Silicon"
-        decode_compute_mult = 0.88
-        prefill_compute_mult = 0.85
+        decode_compute_mult = 0.92
+        prefill_compute_mult = 0.88
     else:
         simd_tier = "Scalar / Legacy SIMD (Unsupported for high speed)"
         decode_compute_mult = 0.25
         prefill_compute_mult = 0.20
 
-    # Calibrate effective bandwidth against Zen 5 9955HX reference
-    # On Ryzen 9 9955HX (dual-channel DDR5-5600, ~89 GB/s theoretical peak),
-    # Python multiprocessing ctypes.memcpy achieves ~44.5 GB/s sustained user-space copy
-    # and verified production decode is:
-    #   - Base floor (high-entropy): 17.2 tok/s
-    #   - Prose + Python/C++ code (RouteCrack 78.6% acc): 19.5 - 20.9 tok/s
-    #   - Structured <tool_call> / JSON (RouteCrack): 24.8 - 28.0 tok/s
-    #   - Warm TTFT (39 delta tokens at 22.3K context): 0.45 s
-    ref_memcpy_bw = 44.5
+    # Calibrate effective pure-read bandwidth against Zen 5 9955HX/9950X reference (~50.0 GB/s pure read)
+    ref_memcpy_bw = 48.0
     eff_bw = measured_bw_gbs if measured_bw_gbs > 5.0 else 38.0
     bw_ratio = eff_bw / ref_memcpy_bw
 
@@ -380,13 +403,16 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
     l3_mb = cpu["l3_total_mb"]
     if l3_mb >= 256.0:
         l3_status = f"FULL 256K KV + HOT EXPERTS IN L3 ({l3_mb:.0f} MB LLC)"
-        l3_mult = 1.18
+        l3_mult = 1.22
+    elif l3_mb >= 120.0:
+        l3_status = f"MULTI-CCD HIGH-CAPACITY L3 RESIDENCY ({l3_mb:.0f} MB L3)"
+        l3_mult = 1.12
     elif l3_mb >= 60.0:
         l3_status = f"OPTIMAL SWA + MAMBA-2 L3 RESIDENCY ({l3_mb:.0f} MB L3)"
         l3_mult = 1.00
     elif l3_mb >= 24.0:
         l3_status = f"PARTIAL L3 RESIDENCY ({l3_mb:.0f} MB L3 — recommend LLAMA_ATTN_WINDOW=4096)"
-        l3_mult = 0.90
+        l3_mult = 0.92
     else:
         l3_status = f"SMALL L3 ({l3_mb:.0f} MB — high L3 eviction pressure)"
         l3_mult = 0.78
@@ -395,7 +421,7 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
     core_ratio = min(cpu["physical_cores"] / 16.0, 4.0)
 
     # Combined decode multiplier (memory-bandwidth dominated + SIMD unpacking + L3 protection)
-    decode_scale = (0.72 * bw_ratio + 0.28 * (decode_compute_mult * min(core_ratio, 1.5))) * decode_compute_mult * l3_mult
+    decode_scale = (0.75 * bw_ratio + 0.25 * min(core_ratio, 1.5)) * decode_compute_mult * l3_mult
     # Cap unrealistic extrapolations
     decode_scale = max(0.15, min(decode_scale, 5.5))
 

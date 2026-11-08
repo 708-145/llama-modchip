@@ -112,6 +112,11 @@ def get_host_summary() -> Tuple[str, str, str]:
                     ram_gib = int(line.split()[1]) / (1024 * 1024)
                 elif line.startswith("AnonHugePages:"):
                     hp_gib = int(line.split()[1]) / (1024 * 1024)
+        if ram_gib > 65536.0:
+            st = os.statvfs("/dev/shm")
+            shm_gib = (st.f_blocks * st.f_frsize) / (1024.0 ** 3)
+            if shm_gib > 0.5:
+                ram_gib = shm_gib if shm_gib >= 24.0 else shm_gib * 2.0
     except Exception:
         pass
     return cpu, f"{ram_gib:.0f} GB", f"{hp_gib:.2f} GiB"
@@ -276,7 +281,7 @@ def run_benchmark_suite(base_url: str) -> None:
     cpu, ram, hp = get_host_summary()
     raw_model, model_display, _ = detect_active_model(base_url)
     print(f"\n{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.1 — Automated 2-Stage CPU Benchmark Suite                      ║{RESET}")
+    print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.4 — Automated 2-Stage CPU Benchmark Suite                      ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
     print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | 2MB THP: {hp})")
     print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
@@ -314,7 +319,7 @@ def run_benchmark_suite(base_url: str) -> None:
     s2_spec = f"{s2['acc_pct']:.1f}% ({s2['draft_acc']}/{s2['draft_n']})" if s2["draft_n"] > 0 else "Active"
 
     print(f"\n{BOLD}{GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.1 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
+    print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.4 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
     print(f"{BOLD}{GREEN}╠════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
     print(f"  Hardware            : {cpu} ({ram} RAM, 2MB THP: {hp})")
     print(f"  Active Model        : {model_display}")
@@ -341,7 +346,7 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
         return
 
     print(f"{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.1 — Interactive CPU Chat + Live Stockfish-PVS Telemetry        ║{RESET}")
+    print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.4 — Interactive CPU Chat + Live Stockfish-PVS Telemetry        ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
     print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | 2MB THP: {hp})")
     print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
