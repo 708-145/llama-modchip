@@ -34,7 +34,28 @@ def detect_endpoint(explicit_url: Optional[str] = None) -> str:
     )
     if env_url:
         return env_url.rstrip("/")
-    candidates = [f"http://127.0.0.1:{p}" for p in (8787, 8789, 8080, 8001)]
+    gw_host = os.environ.get("GATEWAY_HOST", "").strip()
+    if not gw_host:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        gh_file = os.path.join(repo_root, "workspace", "run", "gateway_host")
+        if os.path.isfile(gh_file):
+            try:
+                with open(gh_file, "r", encoding="utf-8") as f:
+                    gw_host = f.readline().strip()
+            except Exception:
+                pass
+    gw_port = int(os.environ.get("GATEWAY_PORT", "8787"))
+    srv_port = int(os.environ.get("SERVER_PORT", "8789"))
+    hosts = []
+    if gw_host and gw_host not in ("127.0.0.1", "0.0.0.0"):
+        hosts.append(gw_host)
+    hosts.append("127.0.0.1")
+    candidates = []
+    for h in hosts:
+        for p in (gw_port, srv_port, 8080, 8001):
+            u = f"http://{h}:{p}"
+            if u not in candidates:
+                candidates.append(u)
     cfg_path = os.path.expanduser("~/.config/modchip/remote_url")
     if os.path.isfile(cfg_path):
         try:

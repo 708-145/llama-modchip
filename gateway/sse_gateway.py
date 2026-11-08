@@ -17,7 +17,8 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 UPSTREAM_BASE = os.environ.get("LLAMA_BACKEND_URL", os.environ.get("UPSTREAM_BASE", "http://127.0.0.1:8789"))
 GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", "http://127.0.0.1:8787")
+_DEFAULT_CORS_HOST = "127.0.0.1" if GATEWAY_HOST == "0.0.0.0" else GATEWAY_HOST
+GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", f"http://{_DEFAULT_CORS_HOST}:{os.environ.get('GATEWAY_PORT', '8787')}")
 ALLOWED_UPSTREAM_PATHS = (
     "/v1/messages",
     "/v1/chat/completions",

@@ -24,6 +24,12 @@ GATEWAY_PORT="${GATEWAY_PORT:-8787}"
 PID_DIR="${WORKSPACE_DIR}/run"
 SERVER_PID_FILE="${PID_DIR}/server.pid"
 GATEWAY_PID_FILE="${PID_DIR}/gateway.pid"
+GATEWAY_HOST_FILE="${PID_DIR}/gateway_host"
+SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
+if [[ -z "${GATEWAY_HOST:-}" ]] && [[ -f "$GATEWAY_HOST_FILE" ]]; then
+    GATEWAY_HOST="$(head -n 1 "$GATEWAY_HOST_FILE" 2>/dev/null | tr -d '[:space:]')"
+fi
+GATEWAY_HOST="${GATEWAY_HOST:-127.0.0.1}"
 DEFAULT_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
 
 BOLD="\033[1m"
@@ -34,13 +40,19 @@ RESET="\033[0m"
 
 is_port_up() {
     local port="$1"
-    python3 - "$port" <<'PYEOF' 2>/dev/null
+    local host="${2:-127.0.0.1}"
+    [[ "$host" == "0.0.0.0" ]] && host="127.0.0.1"
+    python3 - "$host" "$port" <<'PYEOF' 2>/dev/null
 import sys, socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(0.4)
-rc = s.connect_ex(("127.0.0.1", int(sys.argv[1])))
-s.close()
-sys.exit(0 if rc == 0 else 1)
+host, port = sys.argv[1], int(sys.argv[2])
+for h in ([host, "127.0.0.1"] if host != "127.0.0.1" else ["127.0.0.1"]):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.4)
+    rc = s.connect_ex((h, port))
+    s.close()
+    if rc == 0:
+        sys.exit(0)
+sys.exit(1)
 PYEOF
 }
 
@@ -55,9 +67,15 @@ find_any_active_endpoint() {
         echo "${cand_url%/}"
         return 0
     fi
+    if [[ "$GATEWAY_HOST" != "127.0.0.1" ]] && is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST"; then
+        echo "http://${GATEWAY_HOST}:${GATEWAY_PORT}"
+        return 0
+    fi
     for p in "$GATEWAY_PORT" "$SERVER_PORT" 8080 8001; do
-        if is_port_up "$p"; then
-            echo "http://127.0.0.1:${p}"
+        if is_port_up "$p" "$GATEWAY_HOST"; then
+            local h="$GATEWAY_HOST"
+            [[ "$p" == "$SERVER_PORT" ]] && h="$SERVER_HOST"
+            echo "http://${h}:${p}"
             return 0
         fi
     done
@@ -74,7 +92,7 @@ find_any_active_endpoint() {
 
 find_any_active_port() {
     for p in "$GATEWAY_PORT" "$SERVER_PORT" 8080 8001; do
-        if is_port_up "$p"; then
+        if is_port_up "$p" "$GATEWAY_HOST"; then
             echo "$p"
             return 0
         fi
@@ -122,30 +140,34 @@ cmd_start() {
         exit 1
     fi
 
-    if is_port_up "$SERVER_PORT"; then
-        echo -e "${GREEN}[✓] llama-server is already listening on 127.0.0.1:${SERVER_PORT}${RESET}"
+    if is_port_up "$SERVER_PORT" "$SERVER_HOST"; then
+        echo -e "${GREEN}[✓] llama-server is already listening on ${SERVER_HOST}:${SERVER_PORT}${RESET}"
     else
         if [[ ! -x "${REPO_ROOT}/start_server.sh" ]]; then
             echo -e "${YELLOW}[!] start_server.sh not found. Running './modchip setup --skip-model --model $model' first...${RESET}"
             "${REPO_ROOT}/install.sh" --skip-model --model "$model"
         fi
         echo -e "${CYAN}[*] Starting 256K CPU Engine + Stockfish-PVS v2 (M=7) in background...${RESET}"
-        nohup "${REPO_ROOT}/start_server.sh" "$model" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
+        SERVER_HOST="${SERVER_HOST}" nohup "${REPO_ROOT}/start_server.sh" "$model" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
         echo $! > "$SERVER_PID_FILE"
     fi
 
-    if is_port_up "$GATEWAY_PORT"; then
-        echo -e "${GREEN}[✓] Agentic SSE Gateway & Web HUD already listening on http://127.0.0.1:${GATEWAY_PORT}${RESET}"
+    if is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST"; then
+        echo -e "${GREEN}[✓] Agentic SSE Gateway & Web HUD already listening on http://${GATEWAY_HOST}:${GATEWAY_PORT}${RESET}"
     else
-        export LLAMA_BACKEND_URL="http://127.0.0.1:${SERVER_PORT}"
+        export LLAMA_BACKEND_URL="http://${SERVER_HOST}:${SERVER_PORT}"
+        export GATEWAY_HOST="${GATEWAY_HOST}"
         export GATEWAY_PORT="${GATEWAY_PORT}"
+        echo "${GATEWAY_HOST}" > "$GATEWAY_HOST_FILE"
         nohup python3 "${REPO_ROOT}/gateway/sse_gateway.py" "${GATEWAY_PORT}" > "${WORKSPACE_DIR}/logs/gateway.log" 2>&1 &
         echo $! > "$GATEWAY_PID_FILE"
     fi
 
+    local probe_server_host="$SERVER_HOST"
+    [[ "$probe_server_host" == "0.0.0.0" ]] && probe_server_host="127.0.0.1"
     echo -ne "${CYAN}[*] Waiting for model weights to load & AVX-512/AVX2 repacking (logs: workspace/logs/server.log)...${RESET}"
     for _ in $(seq 1 90); do
-        if curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; then
+        if curl -sf "http://${probe_server_host}:${SERVER_PORT}/health" >/dev/null 2>&1; then
             echo -e " ${GREEN}${BOLD}READY!${RESET}"
             break
         fi
@@ -157,7 +179,7 @@ cmd_start() {
     echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════════════════════╗${RESET}"
     echo -e "${BOLD}${GREEN}║ ♟️  llama-modchip v2.4.0 is LIVE! Choose how you want to interact:           ║${RESET}"
     echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════════════════════╣${RESET}"
-    echo -e "  🌐 ${BOLD}Live Web Chat & Telemetry HUD${RESET} : ${CYAN}http://127.0.0.1:${GATEWAY_PORT}${RESET}"
+    echo -e "  🌐 ${BOLD}Live Web Chat & Telemetry HUD${RESET} : ${CYAN}http://${GATEWAY_HOST}:${GATEWAY_PORT}${RESET}"
     echo -e "  💬 ${BOLD}Interactive Terminal Chat${RESET}     : ${GREEN}./modchip chat${RESET}"
     echo -e "  📊 ${BOLD}Run 2-Stage Speed Benchmark${RESET}   : ${GREEN}./modchip bench${RESET}"
     echo -e "  🤖 ${BOLD}Launch Claude Code Agent CLI${RESET}  : ${GREEN}./modchip claude${RESET}"
@@ -178,6 +200,7 @@ cmd_stop() {
             rm -f "$pf"
         fi
     done
+    rm -f "$GATEWAY_HOST_FILE"
     pkill -f "llama-server-nemotron" 2>/dev/null && stopped=1 || true
     pkill -f "gateway/sse_gateway.py" 2>/dev/null && stopped=1 || true
     if [[ "$stopped" -eq 1 ]]; then
@@ -198,8 +221,8 @@ cmd_status() {
         if [[ -n "$active_model" ]]; then
             echo -e "${GREEN}${BOLD}[MODEL]${RESET}  ${BOLD}${active_model}${RESET}"
         fi
-        if is_port_up "$GATEWAY_PORT"; then
-            echo -e "${GREEN}${BOLD}[WEB UI]${RESET} Live Web Chat & Telemetry HUD: ${CYAN}http://127.0.0.1:${GATEWAY_PORT}${RESET}"
+        if is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST"; then
+            echo -e "${GREEN}${BOLD}[WEB UI]${RESET} Live Web Chat & Telemetry HUD: ${CYAN}http://${GATEWAY_HOST}:${GATEWAY_PORT}${RESET}"
         fi
     else
         echo -e "${YELLOW}[OFFLINE]${RESET} No active server detected. Run ${BOLD}./modchip start${RESET} to launch."
@@ -229,7 +252,7 @@ cmd_web() {
     local url
     if ! url="$(find_any_active_endpoint)"; then
         ensure_ready_and_running "$@"
-        url="http://127.0.0.1:${GATEWAY_PORT}"
+        url="http://${GATEWAY_HOST}:${GATEWAY_PORT}"
     fi
     echo -e "${GREEN}[*] Opening Live Web Chat & Telemetry HUD at ${CYAN}${url}${RESET}"
     if command -v xdg-open >/dev/null 2>&1; then
@@ -262,7 +285,7 @@ cmd_claude() {
     local ep
     if ! ep="$(find_any_active_endpoint)"; then
         ensure_ready_and_running
-        ep="http://127.0.0.1:${GATEWAY_PORT}"
+        ep="http://${GATEWAY_HOST}:${GATEWAY_PORT}"
     fi
     export ANTHROPIC_BASE_URL="${ep}"
     export ANTHROPIC_API_KEY="${VEX_API_KEY:-not-needed}"
