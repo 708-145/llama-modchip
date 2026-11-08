@@ -21,11 +21,20 @@ _DEFAULT_CORS_HOST = "127.0.0.1" if GATEWAY_HOST == "0.0.0.0" else GATEWAY_HOST
 GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", f"http://{_DEFAULT_CORS_HOST}:{os.environ.get('GATEWAY_PORT', '8787')}")
 ALLOWED_UPSTREAM_PATHS = (
     "/v1/messages",
+    "/messages",
     "/v1/chat/completions",
+    "/chat/completions",
+    "/v1/completions",
+    "/completions",
     "/v1/models",
+    "/models",
+    "/v1/embeddings",
+    "/embeddings",
     "/v1/complete",
+    "/complete",
     "/health",
     "/tokenize",
+    "/props",
 )
 _GATEWAY_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_GATEWAY_DIR)
@@ -1488,7 +1497,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         harp_meta = None
         tool_schemas = {}
 
-        if self.path.startswith("/v1/messages"):
+        if self.path.startswith("/v1/messages") or self.path.startswith("/messages"):
             try:
                 data = json.loads(body_bytes.decode("utf-8"))
                 messages = data.get("messages", [])
@@ -1794,9 +1803,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 target_upstream = UPSTREAM_BASE
                 harp_meta = None
 
-        if not self.path.startswith("/v1/messages"):
+        if not (self.path.startswith("/v1/messages") or self.path.startswith("/messages")):
             _last_endpoint_was_chat = True
-            if self.path.startswith("/v1/chat/completions") and body_bytes:
+            if (self.path.startswith("/v1/chat/completions") or self.path.startswith("/chat/completions")) and body_bytes:
                 try:
                     cdata = json.loads(body_bytes.decode("utf-8"))
                     cmsgs = cdata.get("messages") or []
@@ -1841,7 +1850,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 headers_sent = True
 
-                if is_event_stream and self.path.startswith("/v1/messages"):
+                if is_event_stream and (self.path.startswith("/v1/messages") or self.path.startswith("/messages")):
                     stream_filter = ThinkBlockFilter(mode=active_mode, schemas=tool_schemas)
                     utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     last_event_time = time.time()
@@ -1887,7 +1896,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             return
                 else:
                     full_body = upstream.read()
-                    if self.path.startswith("/v1/messages"):
+                    if self.path.startswith("/v1/messages") or self.path.startswith("/messages"):
                         try:
                             resp_json = json.loads(full_body.decode("utf-8"))
                             resp_json = sanitize_non_streaming_response(resp_json, tool_schemas)
