@@ -236,14 +236,30 @@ print(len(cores) if cores else (os.cpu_count() or 8))
 ')"
 
 TOTAL_RAM_GB="$(python3 -c '
+import glob
+ram_gb = 32
 try:
     with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("MemTotal:"):
-                print(int(line.split()[1]) // (1024 * 1024))
+                ram_gb = int(line.split()[1]) // (1024 * 1024)
                 break
 except Exception:
-    print(32)
+    pass
+if ram_gb > 65536:
+    try:
+        numa_kb = 0
+        for p in glob.glob("/sys/devices/system/node/node*/meminfo"):
+            with open(p) as nf:
+                for nline in nf:
+                    if "MemTotal:" in nline:
+                        numa_kb += int(nline.split()[3])
+                        break
+        if numa_kb > 0:
+            ram_gb = numa_kb // (1024 * 1024)
+    except Exception:
+        pass
+print(ram_gb)
 ')"
 
 if [[ "$TOTAL_RAM_GB" -ge 30 ]]; then

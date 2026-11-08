@@ -371,6 +371,23 @@ def probe_hardware() -> HardwareInfo:
                     kb = int(line.split()[1])
                     ram_total_gib = round(kb / (1024 * 1024), 1)
                     break
+        if ram_total_gib > 65536.0:
+            numa_kb = 0
+            for npath in glob.glob("/sys/devices/system/node/node*/meminfo"):
+                try:
+                    with open(npath, "r") as nf:
+                        for nline in nf:
+                            if "MemTotal:" in nline:
+                                numa_kb += int(nline.split()[-2])
+                except OSError:
+                    pass
+            if 0 < numa_kb < (65536 * 1024 * 1024):
+                ram_total_gib = round(numa_kb / (1024 * 1024), 1)
+            else:
+                st = os.statvfs("/dev/shm")
+                shm_gib = (st.f_blocks * st.f_frsize) / (1024.0 ** 3)
+                if shm_gib > 0.5:
+                    ram_total_gib = round(shm_gib if shm_gib >= 24.0 else shm_gib * 2.0, 1)
     except OSError:
         pass
 

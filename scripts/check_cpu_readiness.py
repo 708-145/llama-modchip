@@ -244,10 +244,25 @@ def detect_memory_and_thp():
             pass
 
         # Handle un-capped LXC / container cgroups that report 1 PiB (1048576 GiB) MemTotal
-        if mem["total_gb"] > 65536.0 and mem["shm_total_gb"] > 0.5:
-            # If /dev/shm was resized to ~100% of host RAM via --apply-shm (or default 50%)
-            mem["total_gb"] = mem["shm_total_gb"] if mem["shm_total_gb"] >= 24.0 else mem["shm_total_gb"] * 2.0
-            mem["available_gb"] = min(mem["available_gb"], mem["total_gb"] * 0.85)
+        if mem["total_gb"] > 65536.0:
+            numa_kb = 0
+            numa_free_kb = 0
+            for npath in glob.glob("/sys/devices/system/node/node*/meminfo"):
+                try:
+                    with open(npath, "r", encoding="utf-8") as nf:
+                        for nline in nf:
+                            if "MemTotal:" in nline:
+                                numa_kb += int(nline.split()[-2])
+                            elif "MemFree:" in nline:
+                                numa_free_kb += int(nline.split()[-2])
+                except Exception:
+                    pass
+            if 0 < numa_kb < (65536 * 1024 * 1024):
+                mem["total_gb"] = numa_kb / (1024.0 * 1024.0)
+                mem["available_gb"] = min(mem["available_gb"], max(numa_free_kb / (1024.0 * 1024.0), mem["total_gb"] * 0.80))
+            elif mem["shm_total_gb"] > 0.5:
+                mem["total_gb"] = mem["shm_total_gb"] if mem["shm_total_gb"] >= 24.0 else mem["shm_total_gb"] * 2.0
+                mem["available_gb"] = min(mem["available_gb"], mem["total_gb"] * 0.85)
     elif platform.system() == "Darwin":
         tot = run_cmd("sysctl -n hw.memsize")
         if tot.isdigit():

@@ -113,10 +113,23 @@ def get_host_summary() -> Tuple[str, str, str]:
                 elif line.startswith("AnonHugePages:"):
                     hp_gib = int(line.split()[1]) / (1024 * 1024)
         if ram_gib > 65536.0:
-            st = os.statvfs("/dev/shm")
-            shm_gib = (st.f_blocks * st.f_frsize) / (1024.0 ** 3)
-            if shm_gib > 0.5:
-                ram_gib = shm_gib if shm_gib >= 24.0 else shm_gib * 2.0
+            import glob
+            numa_kb = 0
+            for npath in glob.glob("/sys/devices/system/node/node*/meminfo"):
+                try:
+                    with open(npath, "r", encoding="utf-8") as nf:
+                        for nline in nf:
+                            if "MemTotal:" in nline:
+                                numa_kb += int(nline.split()[-2])
+                except Exception:
+                    pass
+            if 0 < numa_kb < (65536 * 1024 * 1024):
+                ram_gib = numa_kb / (1024.0 * 1024.0)
+            else:
+                st = os.statvfs("/dev/shm")
+                shm_gib = (st.f_blocks * st.f_frsize) / (1024.0 ** 3)
+                if shm_gib > 0.5:
+                    ram_gib = shm_gib if shm_gib >= 24.0 else shm_gib * 2.0
     except Exception:
         pass
     return cpu, f"{ram_gib:.0f} GB", f"{hp_gib:.2f} GiB"
