@@ -198,9 +198,55 @@ cmd_start() {
         fi
     fi
 
+    local start_gw=0
     if is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST"; then
-        echo -e "${GREEN}[✓] Agentic SSE Gateway & Web HUD already listening on http://${GATEWAY_HOST}:${GATEWAY_PORT}${RESET}"
+        local probe_gw="$GATEWAY_HOST"
+        [[ "$probe_gw" == "0.0.0.0" ]] && probe_gw="127.0.0.1"
+        local disk_gw_hash live_gw_hash prev_gw_host=""
+        disk_gw_hash="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()[:16])' "${REPO_ROOT}/gateway/sse_gateway.py" 2>/dev/null || true)"
+        live_gw_hash="$(curl -s -X OPTIONS -D - -o /dev/null --max-time 2 "http://${probe_gw}:${GATEWAY_PORT}/" 2>/dev/null | awk 'tolower($1)=="x-modchip-gateway:" {gsub(/\r/,"",$2); print $2; exit}' || true)"
+        if [[ -f "$GATEWAY_HOST_FILE" ]]; then
+            prev_gw_host="$(head -n 1 "$GATEWAY_HOST_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+        if [[ -n "$disk_gw_hash" && "$live_gw_hash" != "$disk_gw_hash" ]] || [[ -n "$prev_gw_host" && "$prev_gw_host" != "$GATEWAY_HOST" ]]; then
+            local gw_pid="" gw_comm=""
+            if command -v lsof >/dev/null 2>&1; then
+                gw_pid="$(lsof -nP -t -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+            elif command -v ss >/dev/null 2>&1; then
+                gw_pid="$(ss -Hltnp "sport = :$GATEWAY_PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -n 1 || true)"
+            fi
+            if [[ -z "$gw_pid" && -f "$GATEWAY_PID_FILE" ]]; then
+                gw_pid="$(cat "$GATEWAY_PID_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+            fi
+            if [[ -n "$gw_pid" ]]; then
+                gw_comm="$(ps -o comm= -p "$gw_pid" 2>/dev/null | tr -d '[:space:]' || true)"
+                gw_comm="${gw_comm##*/}"
+            fi
+            if [[ -n "$gw_pid" ]] \
+               && [[ "$(ps -o uid= -p "$gw_pid" 2>/dev/null | tr -d '[:space:]')" == "$(id -u)" ]] \
+               && [[ "$gw_comm" =~ ^[Pp]ython ]] \
+               && ps -o args= -p "$gw_pid" 2>/dev/null | grep -qF "${REPO_ROOT}/gateway/sse_gateway.py"; then
+                echo -e "${CYAN}[*] Reloading sse_gateway.py (pid ${gw_pid}) to apply updated gateway code/config...${RESET}"
+                kill "$gw_pid" 2>/dev/null || true
+                for _ in $(seq 1 50); do
+                    is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST" || break
+                    sleep 0.1
+                done
+                if ! is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST"; then
+                    start_gw=1
+                else
+                    echo -e "${YELLOW}[!] Gateway pid ${gw_pid} did not exit cleanly; run './modchip stop' to force-restart.${RESET}"
+                fi
+            else
+                echo -e "${GREEN}[✓] Agentic SSE Gateway & Web HUD already listening on http://${GATEWAY_HOST}:${GATEWAY_PORT}${RESET}"
+            fi
+        else
+            echo -e "${GREEN}[✓] Agentic SSE Gateway & Web HUD already listening on http://${GATEWAY_HOST}:${GATEWAY_PORT}${RESET}"
+        fi
     else
+        start_gw=1
+    fi
+    if [[ "$start_gw" -eq 1 ]]; then
         export LLAMA_BACKEND_URL="http://${SERVER_HOST}:${SERVER_PORT}"
         export GATEWAY_HOST="${GATEWAY_HOST}"
         export GATEWAY_PORT="${GATEWAY_PORT}"
@@ -247,8 +293,10 @@ cmd_stop() {
         fi
     done
     rm -f "$GATEWAY_HOST_FILE"
-    pkill -f "llama-server-nemotron" 2>/dev/null && stopped=1 || true
-    pkill -f "gateway/sse_gateway.py" 2>/dev/null && stopped=1 || true
+    local esc_repo
+    esc_repo="$(printf '%s' "$REPO_ROOT" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+    pkill -u "$(id -u)" -f "llama-server-nemotron" 2>/dev/null && stopped=1 || true
+    pkill -u "$(id -u)" -f "(^|/)[Pp]ython[0-9.]* .*${esc_repo}/gateway/sse_gateway\.py" 2>/dev/null && stopped=1 || true
     if [[ "$stopped" -eq 1 ]]; then
         echo -e "${GREEN}[✓] Stopped llama-server and sse_gateway.${RESET}"
     else

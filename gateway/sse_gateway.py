@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import codecs
+import hashlib
 import json
 import re
 import shlex
@@ -19,23 +20,54 @@ UPSTREAM_BASE = os.environ.get("LLAMA_BACKEND_URL", os.environ.get("UPSTREAM_BAS
 GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 _DEFAULT_CORS_HOST = "127.0.0.1" if GATEWAY_HOST == "0.0.0.0" else GATEWAY_HOST
 GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", f"http://{_DEFAULT_CORS_HOST}:{os.environ.get('GATEWAY_PORT', '8787')}")
-ALLOWED_UPSTREAM_PATHS = (
+ALLOWED_POST_PATHS = frozenset({
     "/v1/messages",
-    "/messages",
+    "/v1/messages/count_tokens",
     "/v1/chat/completions",
-    "/chat/completions",
+    "/v1/chat/completions/input_tokens",
     "/v1/completions",
     "/completions",
-    "/v1/models",
-    "/models",
     "/v1/embeddings",
     "/embeddings",
     "/v1/complete",
     "/complete",
-    "/health",
     "/tokenize",
+})
+ALLOWED_GET_PATHS = frozenset({
+    "/health",
+    "/v1/models",
     "/props",
-)
+})
+_ROOT_ROUTE_ALIASES = {
+    "/chat/completions": "/v1/chat/completions",
+    "/chat/completions/input_tokens": "/v1/chat/completions/input_tokens",
+    "/models": "/v1/models",
+    "/messages": "/v1/messages",
+    "/messages/count_tokens": "/v1/messages/count_tokens",
+    "/v1/health": "/health",
+}
+_DOT_SEGMENT_RE = re.compile(r"(^|/)\.{1,2}(/|$)")
+try:
+    with open(os.path.abspath(__file__), "rb") as _gwf:
+        GATEWAY_BUILD_HASH = hashlib.sha256(_gwf.read()).hexdigest()[:16]
+except OSError:
+    GATEWAY_BUILD_HASH = "unknown"
+
+
+def _normalize_gateway_path(raw_path: str):
+    """Canonicalize OpenAI/Anthropic routes; return None on dot-segments, backslashes, or percent-encoded paths."""
+    path_only, sep, query = (raw_path or "/").partition("?")
+    if not path_only.startswith("/") or "%" in path_only or "\\" in path_only:
+        return None
+    norm = re.sub(r"/{2,}", "/", path_only)
+    if _DOT_SEGMENT_RE.search(norm):
+        return None
+    while norm == "/v1/v1" or norm.startswith("/v1/v1/"):
+        norm = norm[3:]
+    if len(norm) > 1:
+        norm = norm.rstrip("/")
+    norm = _ROOT_ROUTE_ALIASES.get(norm, norm)
+    return f"{norm}{sep}{query}" if sep else norm
 _GATEWAY_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_GATEWAY_DIR)
 _KV_CACHE_DIR = os.path.join(_REPO_ROOT, "kv_cache")
@@ -1357,13 +1389,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
         pass
 
     def send_cors_headers(self):
+        self.send_header("X-Modchip-Gateway", GATEWAY_BUILD_HASH)
         if not GATEWAY_CORS_ORIGIN:
             return
         self.send_header("Access-Control-Allow-Origin", GATEWAY_CORS_ORIGIN)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
 
+    def _send_json_error(self, code: int, message: str):
+        body = json.dumps({"error": {"message": message, "type": "invalid_request_error", "code": code}}).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self):
+        norm_path = _normalize_gateway_path(self.path)
+        if norm_path is None:
+            self._send_json_error(400, "Malformed request path")
+            return
+        self.path = norm_path
         self.send_response(200)
         self.send_cors_headers()
         self.end_headers()
@@ -1384,6 +1431,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        norm_path = _normalize_gateway_path(self.path)
+        if norm_path is None:
+            self._send_json_error(400, "Malformed request path")
+            return
+        self.path = norm_path
         clean_path = self.path.split("?", 1)[0]
         if clean_path not in ("/", "/index.html", "/ui", "/health") and not self._check_auth():
             return
@@ -1476,6 +1528,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _last_endpoint_was_chat
+        norm_path = _normalize_gateway_path(self.path)
+        if norm_path is None:
+            self._send_json_error(400, "Malformed request path")
+            return
+        self.path = norm_path
         if not self._check_auth():
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -1497,7 +1554,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         harp_meta = None
         tool_schemas = {}
 
-        if self.path.startswith("/v1/messages") or self.path.startswith("/messages"):
+        clean_post_path = self.path.split("?", 1)[0]
+        if clean_post_path == "/v1/messages":
             try:
                 data = json.loads(body_bytes.decode("utf-8"))
                 messages = data.get("messages", [])
@@ -1803,18 +1861,45 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 target_upstream = UPSTREAM_BASE
                 harp_meta = None
 
-        if not (self.path.startswith("/v1/messages") or self.path.startswith("/messages")):
+        if clean_post_path not in ("/v1/messages", "/v1/messages/count_tokens"):
             _last_endpoint_was_chat = True
-            if (self.path.startswith("/v1/chat/completions") or self.path.startswith("/chat/completions")) and body_bytes:
+            if clean_post_path == "/v1/chat/completions" and body_bytes:
                 try:
                     cdata = json.loads(body_bytes.decode("utf-8"))
-                    cmsgs = cdata.get("messages") or []
-                    if cmsgs and not any(m.get("role") == "system" for m in cmsgs):
-                        cmsgs.insert(0, {"role": "system", "content": "You are a helpful, accurate, and concise AI assistant."})
-                        cdata["messages"] = cmsgs
-                    cdata.setdefault("repeat_penalty", 1.05)
-                    cdata.setdefault("repeat_last_n", 64)
-                    body_bytes = json.dumps(cdata).encode("utf-8")
+                    if isinstance(cdata, dict):
+                        cmsgs = cdata.get("messages")
+                        if isinstance(cmsgs, list) and cmsgs:
+                            def _extract_msg_text(c):
+                                if isinstance(c, str):
+                                    return c
+                                if isinstance(c, list):
+                                    return "\n".join(
+                                        p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"
+                                    )
+                                return "" if c is None else str(c)
+
+                            # Merge leading system/developer messages into a single index-0 system message
+                            # so strict Jinja chat templates never fail on multiple or developer-role headers.
+                            lead_sys, rest_msgs, seen_non_sys = [], [], False
+                            for m in cmsgs:
+                                if isinstance(m, dict) and m.get("role") in ("system", "developer") and not seen_non_sys:
+                                    lead_sys.append(_extract_msg_text(m.get("content")))
+                                    continue
+                                if isinstance(m, dict) and m.get("role") == "developer":
+                                    m = {**m, "role": "system"}
+                                seen_non_sys = True
+                                rest_msgs.append(m)
+                            sys_text = "\n\n".join(t for t in lead_sys if t) or "You are a helpful, accurate, and concise AI assistant."
+                            cdata["messages"] = [{"role": "system", "content": sys_text}] + rest_msgs
+                        mct = cdata.pop("max_completion_tokens", None)
+                        if mct is not None:
+                            cdata.setdefault("max_tokens", mct)
+                        cdata.pop("store", None)
+                        # Omit repeat_penalty when non-empty tools list is present (empty tools=[] still gets 1.05)
+                        if not cdata.get("tools"):
+                            cdata.setdefault("repeat_penalty", 1.05)
+                            cdata.setdefault("repeat_last_n", 64)
+                        body_bytes = json.dumps(cdata).encode("utf-8")
                 except Exception:
                     pass
 
@@ -1822,8 +1907,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _forward_request(self, method, body_bytes=None, active_mode="med", target_upstream=UPSTREAM_BASE, harp_meta=None, tool_schemas=None):
         clean_path = self.path.split("?", 1)[0]
-        if not any(clean_path == p or clean_path.startswith(p + "/") for p in ALLOWED_UPSTREAM_PATHS):
-            self.send_error(403, f"Path '{clean_path}' is not in the gateway allow-list.")
+        allowed_set = ALLOWED_POST_PATHS if method == "POST" else ALLOWED_GET_PATHS
+        if clean_path not in allowed_set:
+            self._send_json_error(403, f"Path '{clean_path}' is not in the gateway allow-list")
             return
         url = target_upstream + self.path
         req_headers = {}
@@ -1850,7 +1936,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 headers_sent = True
 
-                if is_event_stream and (self.path.startswith("/v1/messages") or self.path.startswith("/messages")):
+                if is_event_stream and clean_path == "/v1/messages":
                     stream_filter = ThinkBlockFilter(mode=active_mode, schemas=tool_schemas)
                     utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     last_event_time = time.time()
@@ -1896,7 +1982,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             return
                 else:
                     full_body = upstream.read()
-                    if self.path.startswith("/v1/messages") or self.path.startswith("/messages"):
+                    if clean_path == "/v1/messages":
                         try:
                             resp_json = json.loads(full_body.decode("utf-8"))
                             resp_json = sanitize_non_streaming_response(resp_json, tool_schemas)
