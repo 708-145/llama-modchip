@@ -1,0 +1,184 @@
+From 13a6495093062bfe13d09bb9458dfcf56a7467e3 Mon Sep 17 00:00:00 2001
+From: Bobby Grayson <bobbbygrayson+github@gmail.com>
+Date: Sun, 8 Nov 2026 21:37:07 -0500
+Subject: [PATCH] Metal Q2_0: read Fractal-64 fields as words and replace the
+ constant LUT
+
+dequantize_q2_0, dequantize_q2_0_t4 and block_q_n_dot_y(q2_0) now load qs
+and qh as 32-bit words via ushort pairs (the 30-byte block is only 2-byte
+aligned, but qs and qh sit at even offsets) and extract fields with
+register shifts. kvalues_fractal3 is computed from 0x0E080401 instead of
+a constant-memory table, because divergent constant-address reads
+serialize within a SIMD group.
+
+test-backend-ops -b MTL0, q2_0: MUL_MAT 45/45, MUL_MAT_ID 75/75,
+GET_ROWS 4/4, CPY 2/2.
+
+MUL_MAT q2_0 m=4096 n=1 k=14336 (M5 Max), test-backend-ops perf:
+  word loads in block_q_n_dot_y         92.7 us/run
+  + word loads in the dequantizers      92.4
+  + computed kvalues (this commit)      85.7
+The kernel before any of this was only timed while another llama-server
+held the GPU (122.3 us, against 124.8 for the first step under the same
+load), so there is no clean before/after for the commit as a whole. The
+same shape takes 39 us for q4_0 and 46 us for iq1_s: the kernel is still
+ALU-bound on the 3-bit unpack.
+
+End to end this does not move decode:
+
+  llama-bench tg128, --n-cpu-moe 4
+  before                              12.95
+  this commit                         12.96
+  + GGML_METAL_FUSION_DISABLE=1       13.04
+  + GGML_METAL_CONCURRENCY_DISABLE=1  13.21
+
+Serializing Metal's kernels does not slow decode, so the GPU is not on
+the critical path. A 10 s sample of the process during decode puts the
+time in CPU dot products for the CPU-resident experts (layers 0-3):
+ggml_vec_dot_iq1_s_q8_K 19.5K samples, iq2_xxs_q8_K 17.7K, iq1_m_q8_K
+4.0K, with Metal encoding a few dozen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal.metal | 88 ++++++++++++++++++++++------
+ 1 file changed, 71 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index fa025de8..a3682a04 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -176,6 +176,15 @@ void dequantize_q1_0_t4(device const block_q1_0 * xb, short il, thread type4 & r
+ //   w    = d * mult * kvalues_fractal3[idx]
+ constant float kvalues_fractal3_f[8] = { -14.f, -8.f, -4.f, -1.f, 1.f, 4.f, 8.f, 14.f };
+ 
++// kvalues_fractal3[idx] without a constant-memory lookup (divergent constant reads serialize):
++// magnitudes {1,4,8,14} packed in 0x0E080401; idx 0..3 -> -mag[3-idx], idx 4..7 -> +mag[idx-4].
++static inline float q2_0_kval(uint idx) {
++    const bool neg = idx < 4u;
++    const uint j   = idx ^ (neg ? 3u : 4u);
++    const float m  = (float) ((0x0E080401u >> (8u*j)) & 0xFFu);
++    return neg ? -m : m;
++}
++
+ static inline float q2_0_fractal_mult(device const block_q2_0 * xb, short sb) {
+     const uint8_t sc = xb->scales[sb & 3];
+     return (float)(4 + ((sb < 4) ? (sc & 0x0F) : (sc >> 4)));
+@@ -184,18 +193,36 @@ static inline float q2_0_fractal_mult(device const block_q2_0 * xb, short sb) {
+ static inline float q2_0_fractal_val(device const block_q2_0 * xb, short g, short k) {
+     const uint8_t lo2 = (xb->qs[k] >> (2*g)) & 3;
+     const uint8_t hi1 = (xb->qh[k & 7] >> (2*g + (k >> 3))) & 1;
+-    return kvalues_fractal3_f[lo2 | (hi1 << 2)];
++    return q2_0_kval(lo2 | (hi1 << 2));
++}
++
++// Fields are read as 32-bit words through ushort pairs: the 30-byte block is only 2-byte aligned,
++// but qs (offset 6) and qh (offset 22) sit on even offsets.
++static inline uint q2_0_word(device const uint8_t * p) {
++    device const ushort * p16 = (device const ushort *) p;
++    return (uint) p16[0] | ((uint) p16[1] << 16);
+ }
+ 
+ template <typename type4x4>
+ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
++    // il = group g (0..3): weights g*16 + k, k = 0..15
+     const float d  = xb->d;
+     const float s0 = d * q2_0_fractal_mult(xb, 2*il + 0);
+     const float s1 = d * q2_0_fractal_mult(xb, 2*il + 1);
++    const uint h0 = q2_0_word(xb->qh);
++    const uint h1 = q2_0_word(xb->qh + 4);
+ 
+     float4x4 reg_f;
+-    for (short k = 0; k < 16; k++) {
+-        reg_f[k/4][k%4] = (k < 8 ? s0 : s1) * q2_0_fractal_val(xb, il, k);
++    FOR_UNROLL (short w = 0; w < 4; w++) {
++        const uint q = q2_0_word(xb->qs + 4*w);           // qs[4w .. 4w+3]
++        const uint h = (w & 1) ? h1 : h0;                  // qh[(k & 7)] for k = 4w..4w+3
++        const uint hs = 2*il + (w >> 1);                   // + (k >> 3)
++        const float s = (w < 2) ? s0 : s1;
++        FOR_UNROLL (short t = 0; t < 4; t++) {
++            const uint lo2 = (q >> (8*t + 2*il)) & 3u;
++            const uint hi1 = (h >> (8*t + hs))   & 1u;
++            reg_f[w][t] = s * q2_0_kval(lo2 | (hi1 << 2));
++        }
+     }
+ 
+     reg = (type4x4) reg_f;
+@@ -203,14 +230,19 @@ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & re
+ 
+ template <typename type4>
+ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & reg) {
+-    // il in 0..15 selects weights 4*il .. 4*il+3
+-    const short g  = il / 4;
+-    const short k0 = (il % 4) * 4;
+-    const float s  = (float)xb->d * q2_0_fractal_mult(xb, 2*g + (k0 >> 3));
++    // il in 0..15: group g = il/4, weights k = 4*(il%4) .. +3
++    const short g = il / 4;
++    const short w = il % 4;
++    const uint q  = q2_0_word(xb->qs + 4*w);
++    const uint h  = q2_0_word(xb->qh + 4*(w & 1));
++    const uint hs = 2*g + (w >> 1);
++    const float s = (float)xb->d * q2_0_fractal_mult(xb, 2*g + (w >> 1));
+ 
+     float4 reg_f;
+-    for (short t = 0; t < 4; t++) {
+-        reg_f[t] = s * q2_0_fractal_val(xb, g, k0 + t);
++    FOR_UNROLL (short t = 0; t < 4; t++) {
++        const uint lo2 = (q >> (8*t + 2*g)) & 3u;
++        const uint hi1 = (h >> (8*t + hs))  & 1u;
++        reg_f[t] = s * q2_0_kval(lo2 | (hi1 << 2));
+     }
+ 
+     reg = (type4) reg_f;
+@@ -3372,19 +3404,41 @@ inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thre
+     return qb_curr->d * (2.0f * acc - sumy);
+ }
+ 
+-// modchip Fractal-64 Q2_0 dot over the 16 weights of group g = il/16 (sumy unused)
++// modchip Fractal-64 Q2_0 dot over the 16 weights of group g = il/16 (sumy unused).
++// The 24 code bytes are loaded once as 32-bit words (block is only 2-byte aligned, so via ushort
++// pairs) and fields are extracted with register shifts; the first version did two scattered byte
++// loads from device memory per weight.
+ inline float block_q_n_dot_y(device const block_q2_0 * qb_curr, float sumy, thread float * yl, int il) {
+     const short g = il / 16;
++    device const ushort * qs16 = (device const ushort *) qb_curr->qs;
++    device const ushort * qh16 = (device const ushort *) qb_curr->qh;
++
++    uint q[4];
++    FOR_UNROLL (short i = 0; i < 4; i++) {
++        q[i] = (uint) qs16[2*i] | ((uint) qs16[2*i + 1] << 16);
++    }
++    uint h[2];
++    FOR_UNROLL (short i = 0; i < 2; i++) {
++        h[i] = (uint) qh16[2*i] | ((uint) qh16[2*i + 1] << 16);
++    }
++
++    const short sh = 2*g;
+     float acc0 = 0.0f;
+     float acc1 = 0.0f;
+-    FOR_UNROLL (short k = 0; k < 8; k++) {
+-        acc0 += q2_0_fractal_val(qb_curr, g, k) * yl[k];
++    FOR_UNROLL (short k = 0; k < 16; k++) {
++        const uint lo2 = (q[k >> 2]       >> (8*(k & 3) + sh))            & 3u;
++        const uint hi1 = (h[(k & 7) >> 2] >> (8*(k & 3) + sh + (k >> 3))) & 1u;
++        const float v = q2_0_kval(lo2 | (hi1 << 2)) * yl[k];
++        if (k < 8) { acc0 += v; } else { acc1 += v; }
+     }
+-    FOR_UNROLL (short k = 8; k < 16; k++) {
+-        acc1 += q2_0_fractal_val(qb_curr, g, k) * yl[k];
+-    }
+-    return (float)qb_curr->d * (q2_0_fractal_mult(qb_curr, 2*g + 0) * acc0 +
+-                                q2_0_fractal_mult(qb_curr, 2*g + 1) * acc1);
++
++    const uint sc = (uint) ((device const ushort *) qb_curr->scales)[0] | ((uint) ((device const ushort *) qb_curr->scales)[1] << 16);
++    // sub-blocks 2g, 2g+1: g<2 -> low nibbles of scales[2g], scales[2g+1]; g>=2 -> high nibbles of scales[2g-4], scales[2g-3]
++    const uint byte_sh = 8*((2*g) & 3) + ((g >= 2) ? 4 : 0);
++    const float m0 = (float) (4 + ((sc >> byte_sh)       & 0x0F));
++    const float m1 = (float) (4 + ((sc >> (byte_sh + 8)) & 0x0F));
++
++    return (float) qb_curr->d * (m0 * acc0 + m1 * acc1);
+ }
+ 
+ // function for calculate inner product between half a q4_0 block and 16 floats (yl), sumy is SUM(yl[i])
+-- 
+2.56.0
+
