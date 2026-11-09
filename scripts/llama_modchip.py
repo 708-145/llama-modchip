@@ -32,6 +32,17 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from _cpu_topology import (  # noqa: E402
+    discover_l3_domains,
+    drop_l3less_cores,
+    enumerate_online_physical_cores,
+    format_cpu_list,
+    parse_cpu_list,
+)
+
 SHM_PATH = "/dev/shm/llama_modchip.bin"
 SHM_MAGIC = 0x4D4F4443  # "MODC"
 SHM_VERSION = 1
@@ -278,6 +289,9 @@ class HardwareInfo:
 
     @property
     def taskset_mask(self) -> str:
+        env_mask = os.environ.get("TASKSET_MASK", "").strip()
+        if env_mask:
+            return env_mask
         n_phys = len(self.physical_core_cpus)
         t_dec = self.decode_threads
         if self.num_ccds > 2 and n_phys > t_dec and self.num_ccds > 0:
@@ -288,8 +302,8 @@ class HardwareInfo:
                 start = ccd_idx * cores_per_ccd
                 selected.extend(self.physical_core_cpus[start : start + keep_per_ccd])
             if len(selected) == t_dec:
-                return ",".join(str(c) for c in selected)
-        return ",".join(str(c) for c in self.physical_core_cpus)
+                return format_cpu_list(selected)
+        return format_cpu_list(self.physical_core_cpus)
 
     @property
     def omp_proc_bind(self) -> str:
@@ -318,22 +332,7 @@ def probe_hardware() -> HardwareInfo:
             isa_list.append(k.upper())
 
     # Discover L3 cache domains (CCDs) and physical cores
-    l3_domains: Dict[str, int] = {}
-    for p in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cache/index3")):
-        try:
-            with open(os.path.join(p, "shared_cpu_list"), "r") as f:
-                s_list = f.read().strip()
-            with open(os.path.join(p, "size"), "r") as f:
-                sz_str = f.read().strip().upper()
-            if sz_str.endswith("K"):
-                sz_bytes = int(sz_str[:-1]) * 1024
-            elif sz_str.endswith("M"):
-                sz_bytes = int(sz_str[:-1]) * 1024 * 1024
-            else:
-                sz_bytes = int(sz_str)
-            l3_domains[s_list] = sz_bytes
-        except OSError:
-            pass
+    l3_domains = discover_l3_domains()
 
     if not l3_domains:
         num_ccds = 1
@@ -344,24 +343,16 @@ def probe_hardware() -> HardwareInfo:
         total_l3_bytes = sum(l3_domains.values())
         l3_per_ccd_mb = round((total_l3_bytes / num_ccds) / (1024 * 1024), 1)
 
-    # Physical core selection (1 thread per physical core)
-    core_map: Dict[Tuple[int, int], int] = {}
-    for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
-        m = re.search(r"cpu(\d+)$", cpu_dir)
-        if not m:
-            continue
-        cpu_id = int(m.group(1))
-        try:
-            with open(os.path.join(cpu_dir, "topology/physical_package_id")) as f:
-                pkg = int(f.read().strip())
-            with open(os.path.join(cpu_dir, "topology/core_id")) as f:
-                cid = int(f.read().strip())
-            key = (pkg, cid)
-            if key not in core_map or cpu_id < core_map[key]:
-                core_map[key] = cpu_id
-        except OSError:
-            pass
-    phys_cpus = sorted(core_map.values()) if core_map else list(range(os.cpu_count() or 8))
+    # Physical core selection (1 thread per online physical core, excluding minority L3-less LP-E cores)
+    env_mask = os.environ.get("TASKSET_MASK", "").strip()
+    if env_mask:
+        parsed_mask = sorted(parse_cpu_list(env_mask))
+        phys_cpus = parsed_mask if parsed_mask else enumerate_online_physical_cores()
+    else:
+        phys_cpus = enumerate_online_physical_cores()
+        phys_cpus, _ = drop_l3less_cores(
+            phys_cpus, log=lambda msg: sys.stderr.write(msg + "\n")
+        )
 
     ram_total_gib = 64.0
     try:

@@ -311,7 +311,7 @@ if prof.moe_top_k > 0:
     print(f"export LLAMA_MOE_TOP_K=\${{LLAMA_MOE_TOP_K:-{prof.moe_top_k}}}")
 print(f"export OMP_PROC_BIND=\${{OMP_PROC_BIND:-{hw.omp_proc_bind}}}")
 print(f"export OMP_PLACES=cores")
-print(f"export TASKSET_MASK='{hw.taskset_mask}'")
+print(f'export TASKSET_MASK="\${{TASKSET_MASK:-{hw.taskset_mask}}}"')
 print(f"export DECODE_THREADS=\${{DECODE_THREADS:-{hw.decode_threads}}}")
 print(f"export BATCH_THREADS=\${{BATCH_THREADS:-{hw.batch_threads}}}")
 PYEOF

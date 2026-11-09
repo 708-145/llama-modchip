@@ -27,6 +27,18 @@ import subprocess
 import sys
 import time
 
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from _cpu_topology import (  # noqa: E402
+    discover_l3_domains,
+    drop_l3less_cores,
+    enumerate_online_physical_cores,
+    estimate_hybrid_effective_cores,
+    format_cpu_list,
+    parse_cpu_list,
+)
+
 
 # ============================================================================
 # 1. System & CPU Topology Detection
@@ -138,36 +150,30 @@ def detect_cpu_and_cache():
 
         # Fallback L3 detection via sysfs if lscpu didn't report it
         if info["l3_total_mb"] <= 0:
-            try:
-                l3_sz = run_cmd("cat /sys/devices/system/cpu/cpu0/cache/index3/size")
-                if l3_sz:
-                    info["l3_total_mb"] = parse_size_to_mb(l3_sz)
-            except Exception:
-                pass
+            l3_doms = discover_l3_domains()
+            if l3_doms:
+                info["l3_total_mb"] = sum(l3_doms.values()) / (1024.0 * 1024.0)
+                info["l3_instances"] = len(l3_doms)
 
-        # Enumerate exact non-SMT physical core IDs (1 logical CPU per physical package + core_id)
-        core_map = {}
-        for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
-            m = re.search(r"cpu(\d+)$", cpu_dir)
-            if not m:
-                continue
-            cid_num = int(m.group(1))
-            try:
-                with open(os.path.join(cpu_dir, "topology/physical_package_id")) as f:
-                    pkg = int(f.read().strip())
-                with open(os.path.join(cpu_dir, "topology/core_id")) as f:
-                    core_id = int(f.read().strip())
-                key = (pkg, core_id)
-                if key not in core_map or cid_num < core_map[key]:
-                    core_map[key] = cid_num
-            except Exception:
-                pass
-        if core_map:
-            phys_ids = sorted(core_map.values())
-            info["physical_core_ids"] = phys_ids
-            info["physical_cores"] = len(phys_ids)
+        # Enumerate exact online non-SMT physical core IDs & exclude minority L3-less LP-E cores
+        env_mask = os.environ.get("TASKSET_MASK", "").strip()
+        if env_mask:
+            parsed_mask = sorted(parse_cpu_list(env_mask))
+            phys_ids = parsed_mask if parsed_mask else enumerate_online_physical_cores()
+            dropped_lpe = []
         else:
-            info["physical_core_ids"] = list(range(info["physical_cores"]))
+            phys_ids = enumerate_online_physical_cores()
+            phys_ids, dropped_lpe = drop_l3less_cores(
+                phys_ids, log=lambda msg: sys.stderr.write(msg + "\n")
+            )
+        info["physical_core_ids"] = phys_ids
+        info["physical_cores"] = len(phys_ids)
+        info["dropped_no_l3_cores"] = dropped_lpe
+        stat_c, dyn_c, blend_c, is_hyb = estimate_hybrid_effective_cores(phys_ids)
+        info["is_hybrid"] = is_hyb
+        info["hybrid_static_cores"] = round(stat_c, 2)
+        info["hybrid_dynamic_cores"] = round(dyn_c, 2)
+        info["hybrid_blended_cores"] = round(blend_c, 2)
 
     elif info["os"] == "Darwin":
         model = run_cmd("sysctl -n machdep.cpu.brand_string")
@@ -194,10 +200,8 @@ def detect_cpu_and_cache():
         info["physical_core_ids"] = list(range(info["physical_cores"]))
 
     phys_ids = info.get("physical_core_ids", list(range(info["physical_cores"])))
-    if phys_ids == list(range(len(phys_ids))):
-        info["taskset_mask"] = f"0-{len(phys_ids) - 1}" if len(phys_ids) > 1 else "0"
-    else:
-        info["taskset_mask"] = ",".join(str(x) for x in phys_ids)
+    env_mask_override = os.environ.get("TASKSET_MASK", "").strip() if info["os"] == "Linux" else ""
+    info["taskset_mask"] = env_mask_override if env_mask_override else format_cpu_list(phys_ids)
 
     return info
 
@@ -432,16 +436,23 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
         l3_status = f"SMALL L3 ({l3_mb:.0f} MB — high L3 eviction pressure)"
         l3_mult = 0.78
 
-    # Core scaling factor for prefill (reference: 16 physical Zen 5 cores)
-    core_ratio = min(cpu["physical_cores"] / 16.0, 4.0)
+    # Core scaling factor for decode & hybrid-aware static/dynamic bounds for prefill
+    decode_core_ratio = min(cpu["physical_cores"] / 16.0, 4.0)
+    is_hybrid = bool(cpu.get("is_hybrid", False))
+    stat_cores = float(cpu.get("hybrid_static_cores", cpu["physical_cores"]))
+    dyn_cores = float(cpu.get("hybrid_dynamic_cores", cpu["physical_cores"]))
+    stat_core_ratio = min(stat_cores / 16.0, 4.0)
+    dyn_core_ratio = min(dyn_cores / 16.0, 4.0)
 
     # Combined decode multiplier (memory-bandwidth dominated + SIMD unpacking + L3 protection)
-    decode_scale = (0.75 * bw_ratio + 0.25 * min(core_ratio, 1.5)) * decode_compute_mult * l3_mult
+    decode_scale = (0.75 * bw_ratio + 0.25 * min(decode_core_ratio, 1.5)) * decode_compute_mult * l3_mult
     # Cap unrealistic extrapolations
     decode_scale = max(0.15, min(decode_scale, 5.5))
 
-    prefill_scale = (core_ratio ** 0.85) * prefill_compute_mult * min(max(bw_ratio, 0.5), 2.5)
-    prefill_scale = max(0.15, min(prefill_scale, 6.0))
+    bw_prefill_factor = min(max(bw_ratio, 0.5), 2.5)
+    prefill_stat_scale = max(0.15, min((stat_core_ratio ** 0.85) * prefill_compute_mult * bw_prefill_factor, 6.0))
+    prefill_dyn_scale = max(0.15, min((dyn_core_ratio ** 0.85) * prefill_compute_mult * bw_prefill_factor, 6.0))
+    prefill_scale = prefill_stat_scale if is_hybrid else prefill_dyn_scale
 
     # THP penalty check
     thp_ok = mem["thp_enabled"] in ("always", "madvise", "macos_superpages")
@@ -452,6 +463,8 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
     tool_json_tps = 24.8 * decode_scale * thp_mult
     boilerplate_tps = 42.0 * decode_scale * thp_mult
     prefill_tps = 205.0 * prefill_scale * thp_mult
+    prefill_stat_tps = 205.0 * prefill_stat_scale * thp_mult
+    prefill_dyn_tps = 205.0 * prefill_dyn_scale * thp_mult
     warm_ttft_s = max(0.12, 0.46 / max(prefill_scale * thp_mult, 0.2))
     slot_restore_ms = max(6.0, 18.9 / max(bw_ratio, 0.3))
 
@@ -499,6 +512,8 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
             "warm_ttft_sec": round(warm_ttft_s, 2),
             "slot_restore_ms": round(slot_restore_ms, 1),
             "prefill_tok_s": round(prefill_tps, 1),
+            "prefill_static_tok_s": round(prefill_stat_tps, 1),
+            "prefill_dynamic_tok_s": round(prefill_dyn_tps, 1),
             "base_floor_tok_s": round(base_floor_tps, 1),
             "prose_and_code_tok_s": round(prose_code_tps, 1),
             "tool_call_json_tok_s": round(tool_json_tps, 1),
@@ -544,6 +559,10 @@ def main():
     print(f"\n [1] HARDWARE TOPOLOGY & ISA EXTENSIONS")
     print(f"  • CPU Model          : {cpu['model_name']}")
     print(f"  • Physical Cores     : {cpu['physical_cores']} cores ({cpu['logical_threads']} threads, {cpu['sockets']} socket, {cpu['numa_nodes']} NUMA node, non-SMT mask: {cpu['taskset_mask']})")
+    if cpu.get("dropped_no_l3_cores"):
+        print(f"  • Topology Filter    : Excluded L3-less cores {cpu['dropped_no_l3_cores']} (SoC-tile LP-E; set MODCHIP_KEEP_NO_L3=1 to keep)")
+    if cpu.get("is_hybrid"):
+        print(f"  • Hybrid Compute Eq. : {cpu['hybrid_static_cores']:.1f} static .. {cpu['hybrid_dynamic_cores']:.1f} dynamic full-speed core eq.")
     print(f"  • L3 Cache (LLC)     : {cpu['l3_total_mb']:.1f} MiB ({cpu['l3_instances']} instance(s)) -> {rep['l3_status']}")
     print(f"  • SIMD / Matrix ISA  : {rep['simd_tier']}")
     print(f"  • System RAM         : {mem['total_gb']:.1f} GiB total ({mem['available_gb']:.1f} GiB available, /dev/shm: {mem['shm_total_gb']:.1f} GiB)")
@@ -554,7 +573,10 @@ def main():
     print(f"\n [2] ESTIMATED PERFORMANCE ON THIS MACHINE (22K–35K Active Agent Context)")
     print(f"  • Slot 0 Disk Snapshot Restore (22.2K tok) : ~{e['slot_restore_ms']:.1f} ms")
     print(f"  • Warm Interactive TTFT (40-tool prefix)   : ~{e['warm_ttft_sec']:.2f} s")
-    print(f"  • Cold Prompt Prefill Throughput           : ~{e['prefill_tok_s']:.0f} tok/s")
+    if cpu.get("is_hybrid"):
+        print(f"  • Cold Prompt Prefill Throughput           : ~{e['prefill_static_tok_s']:.0f} tok/s (static bound) .. ~{e['prefill_dynamic_tok_s']:.0f} tok/s (dynamic chunks)")
+    else:
+        print(f"  • Cold Prompt Prefill Throughput           : ~{e['prefill_tok_s']:.0f} tok/s")
     print(f"  • Decode — Base Physical Floor (no spec)   : ~{e['base_floor_tok_s']:.1f} tok/s")
     print(f"  • Decode — Technical Prose + New Code      : ~{e['prose_and_code_tok_s']:.1f} tok/s  (RouteCrack ~78% acceptance)")
     print(f"  • Decode — Agent <tool_call> / JSON / XML  : ~{e['tool_call_json_tok_s']:.1f} tok/s")

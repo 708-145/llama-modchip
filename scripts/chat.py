@@ -208,6 +208,61 @@ def get_host_summary() -> Tuple[str, str, str]:
     return cpu, f"{ram_gib:.0f} GB", f"2MB THP: {hp_gib:.2f} GiB"
 
 
+def get_server_affinity_summary() -> str:
+    """Return active llama-server CPU affinity & LP-E filter note on Linux (empty if unavailable)."""
+    if platform.system() != "Linux":
+        return ""
+    mask_str = ""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pid_file = os.path.join(repo_root, "workspace", "run", "server.pid")
+    pids: List[str] = []
+    try:
+        if os.path.isfile(pid_file):
+            with open(pid_file, "r", encoding="utf-8") as f:
+                p = f.read().strip()
+                if p.isdigit():
+                    pids.append(p)
+    except Exception:
+        pass
+    if not pids:
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-n", "llama-server"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            if out.isdigit():
+                pids.append(out)
+        except Exception:
+            pass
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/status", "r", encoding="utf-8") as sf:
+                for sline in sf:
+                    if sline.startswith("Cpus_allowed_list:"):
+                        mask_str = sline.split(":", 1)[1].strip()
+                        break
+            if mask_str:
+                break
+        except Exception:
+            pass
+    dropped_note = ""
+    try:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from _cpu_topology import drop_l3less_cores, enumerate_online_physical_cores
+
+        _, dropped = drop_l3less_cores(enumerate_online_physical_cores())
+        if dropped:
+            dropped_note = f" (excluded L3-less LP-E: {dropped})"
+    except Exception:
+        pass
+    if mask_str:
+        return f"mask={mask_str}{dropped_note}"
+    if dropped_note:
+        return dropped_note.strip()
+    return ""
+
+
 def stream_chat_turn(
     base_url: str,
     messages: List[Dict[str, str]],
@@ -408,6 +463,9 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.4 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
     print(f"{BOLD}{GREEN}╠════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
     print(f"  Hardware            : {cpu} ({ram} RAM, {hp})")
+    aff_note = get_server_affinity_summary()
+    if aff_note:
+        print(f"  CPU Affinity        : {aff_note}")
     print(f"  Active Model        : {model_display}")
     print(f"  Prompt Prefill      : {pp_best:.2f} tok/s")
     print(f"  Decode (New C++20)  : {s1['dec_tps']:.2f} tok/s (TTFT: {s1['ttft_ms']:.0f} ms)")
