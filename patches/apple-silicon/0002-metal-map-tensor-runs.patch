@@ -1,0 +1,173 @@
+From 6b92ae29d4fcaa49e0e595f918e0ecef4f693398 Mon Sep 17 00:00:00 2001
+From: Bobby Grayson <bobbbygrayson+github@gmail.com>
+Date: Sun, 8 Nov 2026 20:51:05 -0500
+Subject: [PATCH] Map each contiguous run of GPU tensors as its own Metal
+ host-ptr buffer
+
+With mmap, llama.cpp wraps one [first, last] byte span per file for the
+GPU, covering every tensor in between, including tensors assigned to the
+CPU. In DeepSeek-V4-Flash-0731-Fractal, output.weight is at byte 0 of
+shard 2 and each layer's routed experts are interleaved with its attention
+tensors. So --n-cpu-moe 8 and -ngl 35 both still mapped 34,782 + 23,137
+MiB, the whole 57.9 GB model, into a 53,084 MiB Metal budget:
+
+  W ggml_metal_log_allocated_size: warning: current allocated size is
+    greater than the recommended max working set size
+  E error: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)
+
+llama-server still printed "model loaded" and "listening on" after that error. It does not
+fail on its own; watch for the line.
+
+The only split that fit before this change pinned whole layers (and
+output) to the CPU, -ot '^output=CPU,^blk\.[0-7]\.=CPU'. That costs 94
+graph splits per token, because the scheduler moves the weightless ops of
+CPU layers to Metal between CPU matmuls.
+
+Now each run of a context's tensors (gaps under 16 MiB merged) becomes its
+own buffer, stored under key idx + k*LLAMA_BUF_RUN_STRIDE, and
+load_all_data binds each tensor to the run buffer that contains it. A
+GGML_ASSERT stops the load if a model has LLAMA_BUF_RUN_STRIDE (4096)
+files or more, where the keys would collide. On
+M5 Max 64 GB with --n-cpu-moe 6, Metal maps 20 runs (~49.5 GB), graph
+splits drop from 94 to 14 at bs=1, and decode goes from 8.9 to 15.7-19.8
+tok/s in llama-server with zero swapouts.
+
+llama-bench, pp512 / tg128, -t 12, iogpu.wired_limit_mb=57344:
+  --n-cpu-moe 6:  56.8 / 14.4    --n-cpu-moe 3:  86.5 / 13.5
+  --n-cpu-moe 4:  77.7 / 15.6    --n-cpu-moe 2: 125.7 / 18.2
+--n-cpu-moe 2 leaves ~6 GB unwired and swaps ~11K pages per request; 4 does not.
+
+Also adds LLAMA_GPU_COPY_WEIGHTS=1, which copies GPU tensors into
+exact-size device buffers. Do not use it on a 64 GB machine: holding both
+the mmap pages and the copies caused 4.95M swapouts (45 GB of swap) and
+still hit Metal OOM. It is kept only as a record of that result.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-model-loader.cpp | 15 ++++++++--
+ src/llama-model-loader.h   |  2 ++
+ src/llama-model.cpp        | 61 +++++++++++++++++++++++++++++---------
+ 3 files changed, 61 insertions(+), 17 deletions(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 37a376ce..4c74f7f9 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1547,10 +1547,19 @@ bool llama_model_loader::load_all_data(
+         if (use_mmap) {
+             const auto & mapping = mappings.at(weight->idx);
+             ggml_backend_buffer_t buf_mmap = nullptr;
+-            if (bufs.count(weight->idx)) {
+-                buf_mmap = bufs.at(weight->idx);
+-            }
+             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
++            // modchip: pick the run buffer that contains this tensor (see LLAMA_BUF_RUN_STRIDE)
++            for (uint32_t key = weight->idx; bufs.count(key); key += LLAMA_BUF_RUN_STRIDE) {
++                ggml_backend_buffer_t b = bufs.at(key);
++                const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(b);
++                if (key == weight->idx) {
++                    buf_mmap = b; // non-run buffers (one per file or one for all files) keep the old behaviour
++                }
++                if (data >= base && data + n_size <= base + ggml_backend_buffer_get_size(b)) {
++                    buf_mmap = b;
++                    break;
++                }
++            }
+ 
+             if (check_tensors) {
+                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index d6b31c23..b0a951c8 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -16,6 +16,8 @@
+ #include <unordered_map>
+ 
+ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
++// modchip: a file mapped as several runs stores run k under key idx + k*LLAMA_BUF_RUN_STRIDE
++#define LLAMA_BUF_RUN_STRIDE 4096u
+ 
+ // lists of buffer types used for each layer
+ using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b4f5af52..c5037b95 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1575,27 +1575,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+ 
++        // modchip: wrapping the mmap span hands the GPU every byte between its first and last tensor
++        // in each file, including CPU-assigned tensors interleaved in between (e.g. --n-cpu-moe experts).
++        // LLAMA_GPU_COPY_WEIGHTS=1 copies GPU tensors into exact-size device buffers instead, while
++        // CPU tensors stay as clean, evictable mmap pages.
++        const bool gpu_copy_weights = getenv("LLAMA_GPU_COPY_WEIGHTS") != nullptr &&
++            ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
++
+         std::vector<ggml_backend_buffer_ptr> bufs;
+-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !gpu_copy_weights) {
+             GGML_ASSERT(!ml.no_alloc);
++            // run k of file idx is stored under idx + k*LLAMA_BUF_RUN_STRIDE; more files than the stride would collide
++            GGML_ASSERT(ml.files.size() < LLAMA_BUF_RUN_STRIDE);
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
+-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
+-                //     then we could just use metal for all layers
+-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
+-                void * addr = nullptr;
+-                size_t first, last; // NOLINT
+-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+-                if (first >= last) {
++                // modchip: map each contiguous run of this context's tensors separately instead of one
++                // [first, last] span per file. With one span, tensors assigned to another device that sit
++                // between this device's tensors (e.g. --n-cpu-moe experts interleaved with attention
++                // weights) are wrapped too, and Metal charges the whole span against its working set.
++                // Runs separated by less than 16 MiB are merged. Extra runs are keyed idx + k*LLAMA_BUF_RUN_STRIDE.
++                std::vector<std::pair<size_t, size_t>> spans;
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                    const auto * w = ml.get_weight(ggml_get_name(t));
++                    if (!w || w->idx != idx) {
++                        continue;
++                    }
++                    spans.emplace_back(w->offs, w->offs + ggml_nbytes(t));
++                }
++                if (spans.empty()) {
+                     continue;
+                 }
++                std::sort(spans.begin(), spans.end());
++                std::vector<std::pair<size_t, size_t>> runs;
++                const size_t merge_gap = 16u << 20;
++                for (const auto & sp : spans) {
++                    if (!runs.empty() && sp.first <= runs.back().second + merge_gap) {
++                        runs.back().second = std::max(runs.back().second, sp.second);
++                    } else {
++                        runs.push_back(sp);
++                    }
++                }
++                void * addr = ml.mappings.at(idx)->addr();
+                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+-                if (buf == nullptr) {
+-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
++                for (size_t r = 0; r < runs.size(); r++) {
++                    const size_t first = runs[r].first;
++                    const size_t last  = runs[r].second;
++                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
++                    if (buf == nullptr) {
++                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
++                    }
++                    bufs.emplace_back(buf);
++                    buf_map.emplace(idx + (uint32_t) r * LLAMA_BUF_RUN_STRIDE, buf);
++                }
++                if (runs.size() > 1) {
++                    LLAMA_LOG_INFO("%s: %s file %u mapped as %zu runs\n", __func__, ggml_backend_buft_name(buft), idx, runs.size());
+                 }
+-                bufs.emplace_back(buf);
+-                buf_map.emplace(idx, buf);
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+-- 
+2.56.0
+
