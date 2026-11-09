@@ -32,7 +32,19 @@ CACHE_RAM="${CACHE_RAM:-1024}"
 CHECKPOINTS="${CHECKPOINTS:-8}"
 KV_TYPE="${KV_TYPE:-q8_0}"
 GATEWAY="${GATEWAY:-0}"
-LLAMA_SERVER="${LLAMA_SERVER:-llama-server}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [[ -z "${LLAMA_SERVER:-}" ]]; then
+    if [[ -x "${REPO_ROOT}/llama.cpp/build/bin/llama-server" ]]; then
+        LLAMA_SERVER="${REPO_ROOT}/llama.cpp/build/bin/llama-server"
+    elif [[ -x "${REPO_ROOT}/workspace/llama.cpp/build/bin/llama-server" ]]; then
+        LLAMA_SERVER="${REPO_ROOT}/workspace/llama.cpp/build/bin/llama-server"
+    else
+        LLAMA_SERVER="llama-server"
+        echo "[run-server] WARNING: using 'llama-server' from PATH; Fractal-64 (Q2_0) GGUFs require './modchip setup' (or bash apple-silicon/setup.sh)." >&2
+    fi
+fi
+echo "[run-server] binary=$LLAMA_SERVER" >&2
 
 if [[ ! -f "$MODEL" ]]; then
     echo "Model not found: $MODEL" >&2

@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
-# build_zen5_llama.sh — Build llama.cpp with 256K Hybrid SWA + L3 NTA + 2MB HugePages + RouteCrack Engine
+# build_zen5_llama.sh — Build llama.cpp with 256K Hybrid SWA + Fractal-64 (AVX-512 / AVX2 / ARM64 SDOT / Metal) + RouteCrack Engine
 set -euo pipefail
 
 LLAMA_DIR="${1:-./llama.cpp}"
+BUILD_DIR="${BUILD_DIR:-${LLAMA_DIR}/build}"
 LLAMA_COMMIT="d2f83055d6e3b379b5d34c4837122a918cf402c2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PATCH_FILE="${REPO_ROOT}/patches/zen5-nemotron-256k-optimizations.patch"
 SPEC_CPP_DIR="${REPO_ROOT}/speculative/cpp"
+OS_NAME="$(uname -s)"
+ARCH_NAME="$(uname -m)"
+NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+
+if [[ "$OS_NAME" == "Darwin" ]]; then
+    if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" == "1" ]]; then
+        echo "[!] WARNING: Running inside a Rosetta x86_64 shell on Apple Silicon! Re-run in a native arm64 terminal ('arch -arm64 bash') for NEON SDOT + Metal performance." >&2
+    fi
+fi
 
 if [[ ! -d "$LLAMA_DIR" ]]; then
     echo "[*] Cloning llama.cpp into $LLAMA_DIR..."
@@ -22,15 +32,22 @@ else
     fi
 fi
 
-echo "[*] Applying 256K Hybrid SWA + Bidirectional L3 NTA + 2MB HugePages patch..."
+echo "[*] Applying 256K Hybrid SWA + Fractal-64 SIMD/Metal + L3 NTA + 2MB HugePages patch..."
 if git -C "$LLAMA_DIR" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
     echo "[i] Patch already applied cleanly in $LLAMA_DIR."
-elif git -C "$LLAMA_DIR" apply --check "$PATCH_FILE"; then
+elif git -C "$LLAMA_DIR" apply --check "$PATCH_FILE" 2>/dev/null; then
     git -C "$LLAMA_DIR" apply "$PATCH_FILE"
     echo "[+] Kernel & KV patches applied cleanly."
 else
-    echo "[!] ERROR: Failed to apply $PATCH_FILE onto $LLAMA_DIR (expected commit $LLAMA_COMMIT)." >&2
-    exit 1
+    echo "[*] Resetting $LLAMA_DIR working tree to clean $LLAMA_COMMIT before applying updated patch..."
+    git -C "$LLAMA_DIR" checkout -- .
+    if git -C "$LLAMA_DIR" apply --check "$PATCH_FILE"; then
+        git -C "$LLAMA_DIR" apply "$PATCH_FILE"
+        echo "[+] Updated kernel & KV patches applied cleanly."
+    else
+        echo "[!] ERROR: Failed to apply $PATCH_FILE onto $LLAMA_DIR (expected commit $LLAMA_COMMIT)." >&2
+        exit 1
+    fi
 fi
 
 echo "[*] Installing native RouteCrack + Stockfish-PVS C++ speculative engine into $LLAMA_DIR/common/..."
@@ -39,38 +56,61 @@ cp -f "${SPEC_CPP_DIR}/rc_trie_v2.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/rc_stockfish.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/ngram-map.cpp" "$LLAMA_DIR/common/"
 
-# Auto-detect CPU SIMD ISA extensions so both Zen 4/5 (AVX-512) and Zen 2/3 / Intel (AVX2) build safely
-CPU_FLAGS=""
-if [[ -r /proc/cpuinfo ]]; then
-    CPU_FLAGS="$(grep -m1 -E '^flags' /proc/cpuinfo || true)"
-fi
+CMAKE_ISA_ARGS=(-DGGML_NATIVE="${GGML_NATIVE:-ON}" -DBUILD_SHARED_LIBS=ON)
 
-CMAKE_ISA_ARGS=(-DGGML_NATIVE=ON -DGGML_OPENMP=ON -DBUILD_SHARED_LIBS=ON)
-if echo "$CPU_FLAGS" | grep -q "avx512_vnni" && echo "$CPU_FLAGS" | grep -q "avx512_bf16"; then
-    echo "[*] Detected AVX-512 VNNI + BF16 (AMD Zen 4/5 or Intel Xeon) — enabling full AVX-512 tile kernels..."
+if [[ "$OS_NAME" == "Darwin" ]]; then
+    METAL_OPT="${GGML_METAL:-ON}"
+    OPENMP_OPT="${GGML_OPENMP:-OFF}"
+    BLAS_OPT="${GGML_BLAS:-ON}"
+    if [[ "$ARCH_NAME" == "arm64" ]]; then
+        echo "[*] Detected macOS Apple Silicon (arm64) — enabling ARM64 NEON SDOT 1x{8,4,3,2} Fractal-64 + Metal=${METAL_OPT} + BLAS=${BLAS_OPT}..."
+    else
+        echo "[*] Detected macOS ($ARCH_NAME) — Metal=${METAL_OPT}, BLAS=${BLAS_OPT}..."
+    fi
     CMAKE_ISA_ARGS+=(
-        -DGGML_AVX512=ON
-        -DGGML_AVX512_VNNI=ON
-        -DGGML_AVX512_VBMI=ON
-        -DGGML_AVX512_BF16=ON
+        -DGGML_OPENMP="${OPENMP_OPT}"
+        -DGGML_METAL="${METAL_OPT}"
+        -DGGML_BLAS="${BLAS_OPT}"
     )
-elif echo "$CPU_FLAGS" | grep -q "avx2"; then
-    echo "[*] Detected AVX2 + FMA — enabling AVX2 native kernels..."
-    CMAKE_ISA_ARGS+=(
-        -DGGML_AVX2=ON
-        -DGGML_FMA=ON
-        -DGGML_F16C=ON
-    )
+elif [[ "$ARCH_NAME" == "aarch64" || "$ARCH_NAME" == "arm64" ]]; then
+    OPENMP_OPT="${GGML_OPENMP:-ON}"
+    echo "[*] Detected Linux ARM64 ($ARCH_NAME) — enabling ARMv8 NEON SDOT 1x{8,4,3,2} Fractal-64 kernels..."
+    CMAKE_ISA_ARGS+=(-DGGML_OPENMP="${OPENMP_OPT}")
 else
-    echo "[*] Using native architecture auto-detection..."
+    # Auto-detect x86_64 CPU SIMD ISA extensions so both Zen 4/5 (AVX-512) and Zen 2/3 / Intel (AVX2) build safely
+    CPU_FLAGS=""
+    if [[ -r /proc/cpuinfo ]]; then
+        CPU_FLAGS="$(grep -m1 -E '^flags' /proc/cpuinfo || true)"
+    fi
+    OPENMP_OPT="${GGML_OPENMP:-ON}"
+    CMAKE_ISA_ARGS+=(-DGGML_OPENMP="${OPENMP_OPT}")
+
+    if echo "$CPU_FLAGS" | grep -q "avx512_vnni" && echo "$CPU_FLAGS" | grep -q "avx512_bf16"; then
+        echo "[*] Detected AVX-512 VNNI + BF16 (AMD Zen 4/5 or Intel Xeon) — enabling full AVX-512 tile kernels..."
+        CMAKE_ISA_ARGS+=(
+            -DGGML_AVX512=ON
+            -DGGML_AVX512_VNNI=ON
+            -DGGML_AVX512_VBMI=ON
+            -DGGML_AVX512_BF16=ON
+        )
+    elif echo "$CPU_FLAGS" | grep -q "avx2"; then
+        echo "[*] Detected AVX2 + FMA — enabling AVX2 native kernels..."
+        CMAKE_ISA_ARGS+=(
+            -DGGML_AVX2=ON
+            -DGGML_FMA=ON
+            -DGGML_F16C=ON
+        )
+    else
+        echo "[*] Using native architecture auto-detection..."
+    fi
 fi
 
-echo "[*] Configuring CMake build..."
-cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" \
+echo "[*] Configuring CMake build in ${BUILD_DIR}..."
+cmake -S "$LLAMA_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     "${CMAKE_ISA_ARGS[@]}"
 
-echo "[*] Building llama-server & llama-quantize with $(nproc) threads..."
-cmake --build "$LLAMA_DIR/build" --config Release -j "$(nproc)" --target llama-server llama-quantize
+echo "[*] Building llama-server, llama-quantize & llama-bench with ${NPROC} threads..."
+cmake --build "$BUILD_DIR" --config Release -j "${NPROC}" --target llama-server llama-quantize llama-bench
 
-echo "[+] Build complete: $LLAMA_DIR/build/bin/llama-server & llama-quantize"
+echo "[+] Build complete: ${BUILD_DIR}/bin/{llama-server,llama-quantize,llama-bench}"
