@@ -8,7 +8,9 @@ and reports exact Prefill tok/s, Decode tok/s, TTFT, and Stockfish-PVS (M=7) dra
 import argparse
 import json
 import os
+import platform
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -114,6 +116,56 @@ def detect_active_model(base_url: str) -> Tuple[str, str, str]:
 
 
 def get_host_summary() -> Tuple[str, str, str]:
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        cpu = "Apple Silicon"
+        ram_gib = 0.0
+        try:
+            brand = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            if brand:
+                cpu = brand
+        except Exception:
+            pass
+        try:
+            mem_bytes = int(
+                subprocess.check_output(
+                    ["sysctl", "-n", "hw.memsize"], text=True, stderr=subprocess.DEVNULL
+                ).strip()
+            )
+            ram_gib = mem_bytes / (1024.0 ** 3)
+        except Exception:
+            pass
+        return cpu, f"{ram_gib:.0f} GB", "Unified Metal"
+
+    if sys_name == "Windows":
+        cpu = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor() or "Windows CPU"
+        ram_gib = 0.0
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                ram_gib = stat.ullTotalPhys / (1024.0 ** 3)
+        except Exception:
+            pass
+        return cpu, f"{ram_gib:.0f} GB", "Windows VirtualAlloc"
+
     cpu = "Generic CPU"
     try:
         with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
@@ -153,7 +205,7 @@ def get_host_summary() -> Tuple[str, str, str]:
                     ram_gib = shm_gib if shm_gib >= 24.0 else shm_gib * 2.0
     except Exception:
         pass
-    return cpu, f"{ram_gib:.0f} GB", f"{hp_gib:.2f} GiB"
+    return cpu, f"{ram_gib:.0f} GB", f"2MB THP: {hp_gib:.2f} GiB"
 
 
 def stream_chat_turn(
@@ -317,7 +369,7 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"\n{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.4 — Automated 2-Stage CPU Benchmark Suite                      ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
-    print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | 2MB THP: {hp})")
+    print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | {hp})")
     print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
     print(f"  • Endpoint : {CYAN}{base_url}{RESET}\n")
 
@@ -355,7 +407,7 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"\n{BOLD}{GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.4 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
     print(f"{BOLD}{GREEN}╠════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
-    print(f"  Hardware            : {cpu} ({ram} RAM, 2MB THP: {hp})")
+    print(f"  Hardware            : {cpu} ({ram} RAM, {hp})")
     print(f"  Active Model        : {model_display}")
     print(f"  Prompt Prefill      : {pp_best:.2f} tok/s")
     print(f"  Decode (New C++20)  : {s1['dec_tps']:.2f} tok/s (TTFT: {s1['ttft_ms']:.0f} ms)")
@@ -382,7 +434,7 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
     print(f"{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.4 — Interactive CPU Chat + Live Stockfish-PVS Telemetry        ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
-    print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | 2MB THP: {hp})")
+    print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | {hp})")
     print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
     print(f"  • Endpoint : {CYAN}{base_url}{RESET}")
     print(f"  • Commands : {YELLOW}/bench{RESET} │ {YELLOW}/think no|med|max{RESET} │ {YELLOW}/model{RESET} │ {YELLOW}/reset{RESET} │ {YELLOW}/exit{RESET}\n")

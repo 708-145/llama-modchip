@@ -151,9 +151,8 @@ if [[ -z "$QUANTIZE_BIN" ]]; then
         "${SCRIPT_DIR}/../workspace/llama.cpp/build/bin/llama-quantize" \
         "./workspace/bin/llama-quantize" \
         "./workspace/llama.cpp/build/bin/llama-quantize" \
-        "./llama.cpp/build/bin/llama-quantize" \
-        "/usr/local/bin/llama-quantize" \
-        "$(command -v llama-quantize 2>/dev/null || true)"; do
+        "${SCRIPT_DIR}/../llama.cpp/build/bin/llama-quantize" \
+        "./llama.cpp/build/bin/llama-quantize"; do
         if [[ -n "$cand" && -x "$cand" ]]; then
             QUANTIZE_BIN="$cand"
             break
@@ -175,8 +174,18 @@ if [[ -z "$QUANTIZE_BIN" || ! -x "$QUANTIZE_BIN" ]]; then
     done
 fi
 
+if [[ -z "$QUANTIZE_BIN" && "$PROFILE" != "fractal64" ]]; then
+    for sys_cand in "/usr/local/bin/llama-quantize" "$(command -v llama-quantize 2>/dev/null || true)"; do
+        if [[ -n "$sys_cand" && -x "$sys_cand" ]]; then
+            QUANTIZE_BIN="$sys_cand"
+            break
+        fi
+    done
+fi
+
 [[ -z "$QUANTIZE_BIN" || ! -x "$QUANTIZE_BIN" ]] && {
-    echo "ERROR: llama-quantize binary not found. Pass --quantize-bin /path/to/llama-quantize" >&2
+    echo "ERROR: Patched llama-quantize binary not found (unpatched system llama-quantize cannot write GGML_TYPE_Q2_0 Fractal-64 blocks)." >&2
+    echo "       Run './modchip setup --skip-model' first or pass --quantize-bin /path/to/patched/llama-quantize" >&2
     exit 1
 }
 
