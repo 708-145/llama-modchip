@@ -88,7 +88,7 @@ While our reference numbers are measured on a dual-channel DDR5 Ryzen 9 9955HX (
 Yes—and in fact, **Nemotron 3.5 30B-A3B** is uniquely suited for **Asymmetric Tensor-Role Offloading** (even on a modest **6–8 GB consumer GPU**) if you split by **tensor function** (`-ot` / `--override-tensor`) rather than splitting naively by layer (`-ngl 15`):
 
 1. **Always-Active Backbone + Full 256K State on GPU (`~3.8 GB` VRAM)**:
-   Out of the 18.7 GB `Q4_0` model, **~15.5 GB** consists of the 128 sparse routed MoE experts (`blk.*.ffn_*_exps.weight`), of which only 4 out of 128 (3.1%) are touched per token. Conversely, the tensors executed on **100% of tokens**—all 46 Mamba-2 SSM projections (`ssm_in`, `ssm_conv1d`, `ssm_out`), all 6 GQA Attention Q/K/V/O projections, the Shared FFN Experts (`ffn_*_shexp`), the MoE router gates (`ffn_gate_inp`), the output head (`output.weight`), **plus the entire 432 MB 256K KV + Mamba-2 state**—fit inside **< 4.0 GB of VRAM**.
+   Out of the `17.59 GiB` (`18.89 GB`) `Q4_0` model, **~15.5 GB** consists of the 128 sparse routed MoE experts across the 23 MoE layers (`blk.*.ffn_*_exps.weight`), of which only 4–6 out of 128 are touched per token. Conversely, the tensors executed on **100% of tokens** across the 52-block stack—all 23 Mamba-2 SSM layers' projections (`ssm_in`, `ssm_conv1d`, `ssm_out`), all 6 GQA Attention Q/K/V/O projections, the Shared FFN Experts (`ffn_*_shexp`), the MoE router gates (`ffn_gate_inp`), the output head (`output.weight`), **plus the entire 432 MB 256K KV + Mamba-2 state**—fit inside **< 4.0 GB of VRAM**.
 2. **Sparse Routed MoE Experts + `RouteCrack` on CPU (`~15.5 GB` System DDR5)**:
    Using `llama.cpp`'s regex tensor override:
    ```bash
@@ -100,20 +100,20 @@ Yes—and in fact, **Nemotron 3.5 30B-A3B** is uniquely suited for **Asymmetric 
    `RouteCrack` drafts 3–4 high-certainty tokens in `0.002 ms` on CPU, allowing the GPU to execute dense attention/SSM prefill and verification at 500+ GB/s VRAM bandwidth while the CPU streams the selected routed experts only **once per 3–4 verified tokens** instead of once per token.
 4. **Verified AMD Vulkan/RADV Community Benchmark (`Ryzen 9 7945HX3D` + `Radeon RX 9070 XT 16GB`)**:
    - **Quant Comparison (`256K` ctx, New Code / In-Context Refactoring)**:
-     - **`Fractal-MXFP4` (`15.2 GB`)**: **`75.1 tok/s` (new code) / `80.8 tok/s` (refactor)** — *Clear hybrid winner*: faster than `Q4_0` while leaving `~0.9 GB` more free VRAM on a 16 GB card.
-     - **`Q4_0` (`16.1 GB`, previous best)**: **`69.7 tok/s` (new code) / `76.2 tok/s` (refactor)**.
-     - **`Fractal-64` (`Q2_0`, `14.35 GB`, Pure CPU)**: **`44.2 tok/s` (new code) / `45.1 tok/s` (refactor)** on pure CPU.
+     - **`Fractal-MXFP4` (`15.2 GB` hybrid build)**: **`75.1 tok/s` (new code) / `80.8 tok/s` (refactor)** — *Clear hybrid winner*: faster than `Q4_0` while leaving `~0.9 GB` more free VRAM on a 16 GB card.
+     - **`Q4_0` (`17.59 GiB` / `18.89 GB`, previous best)**: **`69.7 tok/s` (new code) / `76.2 tok/s` (refactor)**.
+     - **`Fractal-64` (`Q2_0`, `14.35 GiB`, Pure CPU)**: **`44.2 tok/s` (new code) / `45.1 tok/s` (refactor)** on pure CPU.
    - **Crucial Note for Hybrid GPU+CPU Users (Vulkan & CUDA) — `MXFP4` vs `Fractal-64` (`Q2_0`)**:
      > [!IMPORTANT]
-     > **`Fractal-64` (`GGML_TYPE_Q2_0`, `30B / 64w = 3.75 bpw`) is a custom `llama-modchip` CPU SIMD quantization format**: its fused 2-level non-linear LUT + `vpmaddwd` dot-product kernel (`ggml_vec_dot_q2_0_q8_0_generic`) is currently implemented **only in `ggml-cpu`** (neither `ggml-vulkan` nor `ggml-cuda` has a GPU compute shader for `Q2_0` yet). If any `Q2_0` MoE expert layers are offloaded to a GPU (e.g., via `-ngl 99 --n-cpu-moe 30`, which places ~8 MoE layers in VRAM), the GPU backend cannot evaluate `Q2_0` tensors and produces empty/garbage output.
-     > - **For GPU+CPU Hybrid setups (Vulkan or CUDA)**: **Always use `Fractal-MXFP4` (`15.2 GB`)** — `GGML_TYPE_MXFP4` has native GPU shaders in both Vulkan and CUDA *plus* our accelerated CPU kernels, allowing `--n-cpu-moe 30` to pack spare VRAM with MoE layers (`75.1 / 80.8 tok/s`).
-     > - **For Pure CPU setups (or if all 23 MoE layers are kept on CPU via `-ot "\.ffn_.*_exps\.=CPU"`)**: Use **`Fractal-64` (`Q2_0`, `14.35 GB`)** for the lowest RAM footprint and fastest pure-CPU streaming.
+     > **`Fractal-64` (`GGML_TYPE_Q2_0`, `30B / 64w = 3.75 bpw`) is a custom `llama-modchip` quantization format**: its block-64 dot-product kernels are implemented in **`ggml-cpu`** (`AVX-512` / `AVX2` / `ARM64 NEON SDOT`) and **`ggml-metal`** (Apple Silicon), whereas **neither `ggml-vulkan` nor `ggml-cuda` has a GPU compute shader for `Q2_0` yet**. Keep all `Q2_0` MoE expert tensors on CPU when using Vulkan/CUDA (`--n-cpu-moe 52` or `-ot "\.ffn_.*_exps\.=CPU"`).
+     > - **For GPU+CPU Hybrid setups (Vulkan or CUDA)**: **Use `Fractal-MXFP4` or `Q4_0`** — both have native GPU shaders in Vulkan and CUDA *plus* accelerated CPU kernels, allowing `--n-cpu-moe N` to pack spare VRAM with MoE layers (`75.1 / 80.8 tok/s` at `--n-cpu-moe 30` on `16 GB` VRAM).
+     > - **For Pure CPU or Apple Silicon Metal setups**: Use **`Fractal-64` (`Q2_0`, `14.35 GiB`)** for the lowest RAM footprint (`979.9 tok/s` `pp512` / `72.5 tok/s` `tg128` on M4 Max Metal; fastest pure-CPU streaming on x86/ARM).
    - **Key Vulkan/RADV Findings & Flags**:
      ```bash
      llama-server -m NVIDIA-Nemotron-3.5-30B-A3B-Fractal-MXFP4.gguf \
        -ngl 99 --n-cpu-moe 30 --load-mode none -ctk q8_0 -ctv q4_0 -fa ...
      ```
-     - **Native `SSM_SCAN` / `SSM_CONV` on Vulkan**: `llama.cpp`'s Vulkan backend implements `SSM_SCAN` and `SSM_CONV` natively on the GPU, keeping 100% of the 46-layer Mamba-2 backbone + 256K state + ~8–10 of 23 MoE expert layers inside `~13 GB` of GDDR6 VRAM (`~3 GB` headroom).
+     - **Native `SSM_SCAN` / `SSM_CONV` on Vulkan**: `llama.cpp`'s Vulkan backend implements `SSM_SCAN` and `SSM_CONV` natively on the GPU, keeping 100% of the 23-layer Mamba-2 + 6-layer GQA backbone + 256K state + ~8–10 of 23 MoE expert layers inside `~13 GB` of GDDR6 VRAM (`~3 GB` headroom on 16 GB).
      - **Avoiding the GTT Cliff (`--n-cpu-moe 30` + `--load-mode none`)**: `--n-cpu-moe` packs spare VRAM with MoE layers just below the threshold where allocation spills into shared GTT memory, while `--load-mode none` (or `--no-mmap`) locks the remaining CPU-streamed MoE experts in DDR5 RAM. In this hybrid setup, **`Fractal-MXFP4` hits `75.1 / 80.8 tok/s`**, outpacing `Q4_0` by `+4.6–5.4 tok/s` while freeing `~900 MB` of VRAM.
 
 ---
@@ -134,7 +134,7 @@ Yes—and in fact, **Nemotron 3.5 30B-A3B** is uniquely suited for **Asymmetric 
 This question goes straight to the physical **DDR5 Roofline equation** on Dual-Channel DDR5-5600 (`~71.7 GB/s` sustained multi-core read bandwidth on Ryzen 9 9955HX):
 
 ### 1. Why Stock `llama.cpp` Only Hits `17.0 tok/s` Even at Short Context ($0\text{ MB}$ KV Cache)
-At $N=1$ decode, every generated token activates **~1.80 GB** of sparse MoE + shared weights (`4` routed experts + `1` double-width shared expert across 46 MoE layers, plus 46 Mamba-2 SSM layers). At `71.7 GB/s` sustained DRAM bandwidth, the theoretical memory-bandwidth ceiling is $\sim 25.1\text{ ms/tok}$ (`~39.8 tok/s`).
+At $N=1$ decode, every generated token activates **~1.80 GB** of sparse MoE + shared + dense weights (`4` routed experts + `1` double-width shared expert across 23 MoE layers, plus 23 Mamba-2 SSM layers and 6 GQA layers). At `71.7 GB/s` sustained DRAM bandwidth, the theoretical memory-bandwidth ceiling is $\sim 25.1\text{ ms/tok}$ (`~39.8 tok/s`).
 However, because the 4 active experts per layer are scattered non-contiguously across an `18 GB` virtual `mmap` arena (`~4.6 million` 4KB pages), stock `llama.cpp` suffers **14.6M L2 STLB misses/sec** (hardware page-table walks in DRAM) plus cross-CCD Infinity Fabric cache-line snoops, stalling at **`17.0 tok/s`** (`58.8 ms/tok`).
 Collapsing the weight arena into **2MB Transparent HugePages (`MADV_HUGEPAGE`)** (fitting `6.14 GB` directly inside the 3,072-entry Zen 5 L2 STLB $\rightarrow$ **99.6% reduction in STLB misses**), repacking into **AVX-512 VNNI `q4_0_8x8` tiles**, and pinning 16 threads 1:1 to physical cores lifts pure $N=1$ decode from `17.0 tok/s` to **`25.3–32.7 tok/s`**.
 

@@ -32,13 +32,22 @@ fi
 GATEWAY_HOST="${GATEWAY_HOST:-127.0.0.1}"
 FRACTAL_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64.gguf"
 Q4_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
-if [[ -f "$FRACTAL_MODEL" ]]; then
-    DEFAULT_MODEL="$FRACTAL_MODEL"
-elif [[ -f "$Q4_MODEL" ]]; then
-    DEFAULT_MODEL="$Q4_MODEL"
-else
-    DEFAULT_MODEL="$Q4_MODEL"
-fi
+DEFAULT_MODEL_FILE="${PID_DIR}/default_model"
+
+resolve_default_model() {
+    local saved=""
+    if [[ -f "$DEFAULT_MODEL_FILE" ]]; then
+        saved="$(head -n 1 "$DEFAULT_MODEL_FILE" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+    fi
+    if [[ -n "$saved" && -f "$saved" ]]; then
+        printf '%s\n' "$saved"
+    elif [[ -f "$FRACTAL_MODEL" ]]; then
+        printf '%s\n' "$FRACTAL_MODEL"
+    else
+        printf '%s\n' "$Q4_MODEL"
+    fi
+}
+DEFAULT_MODEL="$(resolve_default_model || printf '%s\n' "$Q4_MODEL")"
 
 BOLD="\033[1m"
 GREEN="\033[92m"
@@ -123,7 +132,8 @@ cmd_setup() {
 }
 
 cmd_start() {
-    local model="${1:-$DEFAULT_MODEL}"
+    local explicit_model="${1:-}"
+    local model="${explicit_model:-$DEFAULT_MODEL}"
     mkdir -p "$PID_DIR" "${WORKSPACE_DIR}/logs"
 
     case "$(uname -s)" in
@@ -148,8 +158,32 @@ cmd_start() {
         exit 1
     fi
 
+    if [[ -n "$explicit_model" ]]; then
+        local abs_model
+        case "$model" in
+            /*) abs_model="$model" ;;
+            *)  abs_model="${PWD}/${model}" ;;
+        esac
+        model="$abs_model"
+    fi
+
     if is_port_up "$SERVER_PORT" "$SERVER_HOST"; then
         echo -e "${GREEN}[✓] llama-server is already listening on ${SERVER_HOST}:${SERVER_PORT}${RESET}"
+        if [[ -n "$explicit_model" ]]; then
+            local probe_h="$SERVER_HOST"
+            [[ "$probe_h" == "0.0.0.0" ]] && probe_h="127.0.0.1"
+            local live_model
+            live_model="$(curl -sf --max-time 1 "http://${probe_h}:${SERVER_PORT}/props" 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("model_path") or "")' 2>/dev/null || true)"
+            if [[ -z "$live_model" ]]; then
+                live_model="$(curl -sf --max-time 1 "http://${probe_h}:${SERVER_PORT}/v1/models" 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); m=(d.get("data") or d.get("models") or [{}])[0]; s=(m.get("id") or m.get("name") or ""); print(s if s.lower().endswith(".gguf") else "")' 2>/dev/null || true)"
+            fi
+            if [[ -n "$live_model" && "$(basename "$live_model")" != "$(basename "$model")" ]]; then
+                echo -e "${YELLOW}[!] Active server is currently serving $(basename "$live_model"); run './modchip restart \"${model}\"' to switch models.${RESET}"
+            else
+                printf '%s\n' "$model" > "$DEFAULT_MODEL_FILE"
+                DEFAULT_MODEL="$model"
+            fi
+        fi
     else
         if [[ ! -x "${REPO_ROOT}/start_server.sh" ]]; then
             echo -e "${YELLOW}[!] start_server.sh not found. Running './modchip setup --skip-model --model $model' first...${RESET}"
@@ -158,6 +192,10 @@ cmd_start() {
         echo -e "${CYAN}[*] Starting 256K CPU Engine + Stockfish-PVS v2 (M=7) in background...${RESET}"
         SERVER_HOST="${SERVER_HOST}" nohup "${REPO_ROOT}/start_server.sh" "$model" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
         echo $! > "$SERVER_PID_FILE"
+        if [[ -n "$explicit_model" ]]; then
+            printf '%s\n' "$model" > "$DEFAULT_MODEL_FILE"
+            DEFAULT_MODEL="$model"
+        fi
     fi
 
     if is_port_up "$GATEWAY_PORT" "$GATEWAY_HOST"; then
@@ -252,8 +290,9 @@ ensure_ready_and_running() {
     if [[ ! -f "$DEFAULT_MODEL" ]] || [[ ! -x "${WORKSPACE_DIR}/bin/llama-server-nemotron" ]]; then
         echo -e "${CYAN}[*] First run detected — building patched engine & downloading model automatically...${RESET}"
         "${REPO_ROOT}/install.sh"
+        DEFAULT_MODEL="$(resolve_default_model)"
     fi
-    cmd_start "$DEFAULT_MODEL"
+    cmd_start
 }
 
 cmd_web() {

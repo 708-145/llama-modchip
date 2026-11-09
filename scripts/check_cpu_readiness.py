@@ -521,6 +521,7 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
     has_avx512f = "avx512f" in flags
     has_avx_vnni = "avx_vnni" in flags
     has_avx2 = "avx2" in flags
+    has_avx1 = "avx" in flags
     has_arm_neon = "asimd" in flags or "neon" in flags or "apple_amx" in flags
 
     # SIMD efficiency multiplier relative to Zen 5 AVX-512 VNNI (reference = 1.00)
@@ -534,15 +535,19 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
         prefill_compute_mult = 1.00
     elif has_avx512_vnni or has_avx512f:
         simd_tier = "AVX-512"
-        decode_compute_mult = 0.90
+        decode_compute_mult = 0.92
         prefill_compute_mult = 0.85
     elif has_avx_vnni or has_avx2:
         simd_tier = "AVX2" + (" + AVX-VNNI" if has_avx_vnni else " (No AVX-512 VNNI)")
-        # On 16-24+ core AVX2 systems (e.g. 24-core EPYC 7402P with 8-channel DDR4),
-        # aggregate AVX2 vpmaddwd throughput across cores saturates memory bandwidth
-        many_core_bonus = min(1.0, 0.78 + 0.012 * max(0, cpu["physical_cores"] - 8))
-        decode_compute_mult = 0.88 if has_avx_vnni else many_core_bonus
+        # On memory-bound single-token decode, 6+ AVX2 cores sustain ~90% of AVX-512 throughput per GB/s;
+        # on hybrid Intel P+E CPUs (AVX-VNNI), E-core synchronization adds minor barrier overhead (~0.85).
+        is_hyb_cpu = bool(cpu.get("is_hybrid", False))
+        decode_compute_mult = (0.85 if is_hyb_cpu else 0.92) if has_avx_vnni else 0.90
         prefill_compute_mult = 0.72 if has_avx_vnni else (0.58 if cpu["physical_cores"] < 20 else 0.68)
+    elif has_avx1:
+        simd_tier = "AVX-only (No AVX2)"
+        decode_compute_mult = 0.45
+        prefill_compute_mult = 0.35
     elif has_arm_neon:
         simd_tier = "ARM64 NEON / Apple Silicon"
         decode_compute_mult = 0.92
@@ -552,28 +557,33 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
         decode_compute_mult = 0.25
         prefill_compute_mult = 0.20
 
-    # Calibrate effective pure-read bandwidth against Zen 5 9955HX/9950X reference (~50.0 GB/s pure read)
-    ref_memcpy_bw = 48.0
+    # Calibrate effective pure-read bandwidth against Zen 5 9955HX/9950X reference (~50.5 GB/s pure read)
+    ref_memcpy_bw = 50.5
     eff_bw = measured_bw_gbs if measured_bw_gbs > 5.0 else 38.0
     bw_ratio = eff_bw / ref_memcpy_bw
 
-    # L3 cache residency bonus/penalty
+    # L3 cache residency bonus/penalty:
+    # Active MoE experts (~1.7 GB/token) stream from DRAM regardless of 8-64 MB L3, while EAKV + Mamba-2
+    # keep hot state small; only 128-256+ MB LLCs cache hot shared/routed experts across tokens.
     l3_mb = cpu["l3_total_mb"]
-    if l3_mb >= 256.0:
+    if cpu.get("os") == "Darwin" and cpu.get("arch") == "arm64":
+        l3_status = "APPLE SILICON UNIFIED MEMORY + SLC (macOS hides SLC size)"
+        l3_mult = 1.00
+    elif l3_mb >= 256.0:
         l3_status = f"FULL 256K KV + HOT EXPERTS IN L3 ({l3_mb:.0f} MB LLC)"
-        l3_mult = 1.22
+        l3_mult = 1.12
     elif l3_mb >= 120.0:
         l3_status = f"MULTI-CCD HIGH-CAPACITY L3 RESIDENCY ({l3_mb:.0f} MB L3)"
-        l3_mult = 1.12
+        l3_mult = 1.03
     elif l3_mb >= 60.0:
         l3_status = f"OPTIMAL SWA + MAMBA-2 L3 RESIDENCY ({l3_mb:.0f} MB L3)"
         l3_mult = 1.00
     elif l3_mb >= 24.0:
         l3_status = f"PARTIAL L3 RESIDENCY ({l3_mb:.0f} MB L3 — recommend LLAMA_ATTN_WINDOW=4096)"
-        l3_mult = 0.92
+        l3_mult = 0.97
     else:
         l3_status = f"SMALL L3 ({l3_mb:.0f} MB — high L3 eviction pressure)"
-        l3_mult = 0.78
+        l3_mult = 0.95
 
     # Core scaling factor for decode & hybrid-aware static/dynamic bounds for prefill
     decode_core_ratio = min(cpu["physical_cores"] / 16.0, 4.0)
@@ -583,8 +593,19 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
     stat_core_ratio = min(stat_cores / 16.0, 4.0)
     dyn_core_ratio = min(dyn_cores / 16.0, 4.0)
 
-    # Combined decode multiplier (memory-bandwidth dominated + SIMD unpacking + L3 protection)
-    decode_scale = (0.75 * bw_ratio + 0.25 * min(decode_core_ratio, 1.5)) * decode_compute_mult * l3_mult
+    # Combined decode multiplier:
+    # When measured_bw_gbs > 5.0, the benchmark already ran on cpu["physical_cores"] workers,
+    # so bw_ratio already reflects core-count memory-level parallelism (only <6 cores need a small MLP factor).
+    if measured_bw_gbs > 5.0:
+        core_mlp = min(1.0, 0.70 + 0.05 * cpu["physical_cores"])
+        bw_core_term = bw_ratio * core_mlp
+    else:
+        bw_core_term = 0.75 * bw_ratio + 0.25 * min(decode_core_ratio, 1.5)
+    decode_scale = bw_core_term * decode_compute_mult * l3_mult
+    if cpu.get("os") == "Darwin" and cpu.get("arch") == "arm64":
+        # Apple CPU clusters hit a NEON dequant+dot compute ceiling well below SoC fabric bandwidth;
+        # calibrated to #8 (M4 Max 16C @ 238.9 GB/s -> 49.2-57.7 tok/s prose/code, 70.9-120 agent/refactor).
+        decode_scale = min(decode_scale, 2.7 * min(cpu["physical_cores"] / 16.0, 1.25))
     # Cap unrealistic extrapolations
     decode_scale = max(0.15, min(decode_scale, 5.5))
 
@@ -635,8 +656,12 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
         tier = "TIER D — INSUFFICIENT RAM (< 22 GB Total RAM)"
         summary = "Your system has less than 22 GB of RAM. The 17 GB Q4_0 weights + KV cache will swap to disk."
     elif tool_json_tps >= 45.0:
-        tier = "TIER S — SERVER / WORKSTATION CLASS (ULTRA-FAST CPU INFERENCE)"
-        summary = "Multi-channel DDR5 / large LLC detected. Outperforms reference Zen 5 testbed by a wide margin."
+        if cpu.get("os") == "Darwin" and cpu.get("arch") == "arm64":
+            tier = "TIER S — APPLE SILICON HIGH-BANDWIDTH UNIFIED MEMORY (METAL + NEON)"
+            summary = "High-bandwidth Unified Memory detected; './modchip setup' enables zero-copy Metal GPU + NEON SDOT."
+        else:
+            tier = "TIER S — SERVER / WORKSTATION CLASS (ULTRA-FAST CPU INFERENCE)"
+            summary = "Multi-channel DDR5 / large LLC detected. Outperforms reference Zen 5 testbed by a wide margin."
     elif prose_code_tps >= 16.0:
         tier = "TIER A — PRODUCTION-READY INTERACTIVE CODING AGENT (CLAUDE CODE)"
         summary = "Full 256K context & sub-second warm TTFT with smooth 20-25+ tok/s autonomous coding & tool calls."
@@ -712,9 +737,13 @@ def main():
         print(f"  • Topology Filter    : Excluded L3-less cores {cpu['dropped_no_l3_cores']} (SoC-tile LP-E; set MODCHIP_KEEP_NO_L3=1 to keep)")
     if cpu.get("is_hybrid"):
         print(f"  • Hybrid Compute Eq. : {cpu['hybrid_static_cores']:.1f} static .. {cpu['hybrid_dynamic_cores']:.1f} dynamic full-speed core eq.")
-    print(f"  • L3 Cache (LLC)     : {cpu['l3_total_mb']:.1f} MiB ({cpu['l3_instances']} instance(s)) -> {rep['l3_status']}")
+    if cpu.get("os") == "Darwin" and cpu.get("arch") == "arm64":
+        print(f"  • Cache / Memory     : {rep['l3_status']} (cluster L2: {cpu['l3_total_mb']:.1f} MiB)")
+    else:
+        print(f"  • L3 Cache (LLC)     : {cpu['l3_total_mb']:.1f} MiB ({cpu['l3_instances']} instance(s)) -> {rep['l3_status']}")
     print(f"  • SIMD / Matrix ISA  : {rep['simd_tier']}")
-    print(f"  • System RAM         : {mem['total_gb']:.1f} GiB total ({mem['available_gb']:.1f} GiB available, /dev/shm: {mem['shm_total_gb']:.1f} GiB)")
+    shm_note = f", /dev/shm: {mem['shm_total_gb']:.1f} GiB" if cpu.get("os") == "Linux" else ""
+    print(f"  • System RAM         : {mem['total_gb']:.1f} GiB total ({mem['available_gb']:.1f} GiB available{shm_note})")
     if cpu.get("os") == "Darwin":
         print(f"  • 2MB HugePages (THP): macOS superpages (OK)")
     elif cpu.get("os") != "Linux":
@@ -729,7 +758,8 @@ def main():
     if bw_gbs > 0:
         print(f"  • Sustained DRAM BW  : {rep['measured_bw_gbs']:.1f} GB/s (multi-core user-space streaming)")
 
-    print(f"\n [2] ESTIMATED PERFORMANCE ON THIS MACHINE (22K–35K Active Agent Context)")
+    ctx_note = "CPU-only NEON baseline; Metal GPU offload adds ~1.3-2.0x prefill" if (cpu.get("os") == "Darwin" and cpu.get("arch") == "arm64") else "Q4_0, 22K–35K Active Agent Context"
+    print(f"\n [2] ESTIMATED PERFORMANCE ON THIS MACHINE ({ctx_note})")
     print(f"  • Slot 0 Disk Snapshot Restore (22.2K tok) : ~{e['slot_restore_ms']:.1f} ms")
     print(f"  • Warm Interactive TTFT (40-tool prefix)   : ~{e['warm_ttft_sec']:.2f} s")
     if cpu.get("is_hybrid"):
@@ -737,23 +767,29 @@ def main():
     else:
         print(f"  • Cold Prompt Prefill Throughput           : ~{e['prefill_tok_s']:.0f} tok/s")
     print(f"  • Decode — Base Physical Floor (no spec)   : ~{e['base_floor_tok_s']:.1f} tok/s")
-    print(f"  • Decode — Technical Prose + New Code      : ~{e['prose_and_code_tok_s']:.1f} tok/s  (RouteCrack ~78% acceptance)")
-    print(f"  • Decode — Agent <tool_call> / JSON / XML  : ~{e['tool_call_json_tok_s']:.1f} tok/s")
-    print(f"  • Decode — Refactoring / Boilerplate Burst : ~{e['repetitive_code_tok_s']:.1f} tok/s")
+    print(f"  • Decode — Technical Prose + New Code      : ~{e['prose_and_code_tok_s']:.1f} tok/s  (Q4_0; Fractal-64 varies ~-7% to +30%)")
+    print(f"  • Decode — Refactor / Tool-Call (~67% acc) : ~{e['tool_call_json_tok_s']:.1f} tok/s")
+    print(f"  • Decode — High-Hit Boilerplate Burst      : ~{e['repetitive_code_tok_s']:.1f} tok/s  (90%+ PVS hit)")
     print(f"  • Max Concurrent 256K Agent Workers        : {rep['max_256k_slots']} instance(s)")
 
     print(f"\n [3] VERDICT & RECOMMENDED TUNING")
     print(f"  ► {rep['tier']}")
     print(f"    {rep['summary']}")
 
-    print(f"\n [4] RECOMMENDED LAUNCH FLAGS FOR THIS CPU (via llama_modchip.py)")
-    print(f"  python3 scripts/llama_modchip.py --model /path/to/model.gguf --apply-shm --print-cmd")
-    print(f"  export LLAMA_MOE_TOP_K=4 LLAMA_KV_L3_WINDOW=2048 LLAMA_ATTN_WINDOW=4096 LLAMA_ATTN_SINKS=16 LLAMA_SWA_STRIDE=1 LLAMA_KV_DISABLE_CHUNKING=1 OMP_PROC_BIND=close OMP_PLACES=cores")
-    print(f"  taskset -c {cpu['taskset_mask']} llama-server --model NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \\")
-    print(f"    -c 262144 -np 1 -t {cpu['physical_cores']} -tb {cpu['physical_cores']} -b 2048 -ub 2048 \\")
-    print(f"    --cache-type-k q8_0 --cache-type-v q4_0 --repack --flash-attn auto --cache-reuse 256 --slot-save-path /dev/shm \\")
-    print(f"    --ctx-checkpoints 64 --checkpoint-min-step 128 \\")
-    print(f"    --spec-type ngram-simple --spec-ngram-simple-size-n 4 --spec-ngram-simple-size-m 7 --spec-ngram-simple-min-hits 1")
+    if cpu.get("os") == "Darwin" and cpu.get("arch") == "arm64":
+        print(f"\n [4] RECOMMENDED LAUNCH COMMANDS FOR APPLE SILICON (Metal + NEON SDOT)")
+        print(f"  git clone https://github.com/synchopate/llama-modchip.git && cd llama-modchip")
+        print(f"  ./modchip setup     # builds native arm64 + Metal (Q4_0 & Fractal-64 Q2_0 shaders)")
+        print(f"  ./modchip start && ./modchip bench")
+    else:
+        print(f"\n [4] RECOMMENDED LAUNCH FLAGS FOR THIS CPU (via llama_modchip.py)")
+        print(f"  python3 scripts/llama_modchip.py --model /path/to/model.gguf --apply-shm --print-cmd")
+        print(f"  export LLAMA_MOE_TOP_K=4 LLAMA_KV_L3_WINDOW=2048 LLAMA_ATTN_WINDOW=4096 LLAMA_ATTN_SINKS=16 LLAMA_SWA_STRIDE=1 LLAMA_KV_DISABLE_CHUNKING=1 OMP_PROC_BIND=close OMP_PLACES=cores")
+        print(f"  taskset -c {cpu['taskset_mask']} llama-server --model NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \\")
+        print(f"    -c 262144 -np 1 -t {cpu['physical_cores']} -tb {cpu['physical_cores']} -b 2048 -ub 2048 \\")
+        print(f"    --cache-type-k q8_0 --cache-type-v q4_0 --repack --flash-attn auto --cache-reuse 256 --slot-save-path /dev/shm \\")
+        print(f"    --ctx-checkpoints 64 --checkpoint-min-step 128 \\")
+        print(f"    --spec-type ngram-simple --spec-ngram-simple-size-n 4 --spec-ngram-simple-size-m 7 --spec-ngram-simple-min-hits 1")
     if cpu["numa_nodes"] > 1 or cpu["sockets"] > 1:
         cores_per_node = max(1, cpu["physical_cores"] // max(1, cpu["numa_nodes"]))
         print(f"\n  [!] Multi-NUMA / Multi-Socket Server Detected ({cpu['numa_nodes']} NUMA nodes):")
@@ -761,7 +797,7 @@ def main():
         print(f"      Instead, pin 1 independent agent instance per NUMA node:")
         print(f"      numactl --cpunodebind=0 --membind=0 llama-server ... -t {cores_per_node} --port 8789")
     if not rep["thp_optimal"] and cpu.get("os") == "Linux":
-        print(f"\n  [!] Tip: Enable 2MB Transparent HugePages before launching (backs ~17-18.5 GiB with 2MB pages):")
+        print(f"\n  [i] Optional: Enable 2MB Transparent HugePages before launching (backs ~17-18.5 GiB with 2MB pages):")
         print(f"      echo always        | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null")
         print(f"      echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag  >/dev/null")
         print(f"      (System-wide; resets on reboot — persist via /etc/tmpfiles.d/thp.conf if desired.)")
@@ -771,7 +807,6 @@ def main():
         and not cpu.get("hypervisor")
         and cpu.get("sockets", 1) == 1
         and bw_gbs > 0.0
-        and rep["measured_bw_gbs"] <= 31.5
     ):
         chassis = ""
         try:
@@ -779,18 +814,24 @@ def main():
                 chassis = cf.read().strip()
         except OSError:
             pass
-        is_portable = chassis in ("8", "9", "10", "14", "30", "31", "32")
-        print(f"\n  [i] Measured DRAM bandwidth is low ({rep['measured_bw_gbs']:.1f} GB/s).")
-        if is_portable:
-            print(f"      On laptops, check whether only one memory channel is populated:")
-            print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
-            print(f"      Ignore this if dual-channel RAM is already running at its rated speed.")
-        else:
-            print(f"      On desktops this often means RAM at JEDEC default (DDR4-2133/2400) instead of its")
-            print(f"      XMP/DOCP/EXPO rating, or only one channel populated. Check:")
-            print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
-            print(f"      Ignore this if your RAM already runs at its rated speed (common on laptops).")
-            print(f"      (In Issue #17, decode scaled ~+48-50% from 2133 -> 3200 MT/s.)")
+        model_str = cpu.get("model_name", "")
+        is_mobile_sku = (not re.search(r"\b(EPYC|Xeon|Threadripper)\b", model_str, re.I)) and bool(
+            re.search(r"\b\d{3,5}(?:U|H|HS|HX|HX3D|P|G\d|V)\b", model_str) or re.search(r"\bRyzen AI\b", model_str, re.I)
+        )
+        is_portable = chassis in ("8", "9", "10", "14", "30", "31", "32", "35", "36") or is_mobile_sku
+        bw_warn_limit = 25.0 if is_portable else 31.5
+        if rep["measured_bw_gbs"] <= bw_warn_limit:
+            print(f"\n  [i] Measured DRAM bandwidth is low ({rep['measured_bw_gbs']:.1f} GB/s).")
+            if is_portable:
+                print(f"      On laptops / mini-PCs, check whether only one memory channel is populated or CPU power is capped:")
+                print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
+                print(f"      Ignore this if dual-channel RAM is already running at its rated speed on AC power.")
+            else:
+                print(f"      On desktops this often means RAM at JEDEC default (DDR4-2133/2400) instead of its")
+                print(f"      XMP/DOCP/EXPO rating, or only one channel populated. Check:")
+                print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
+                print(f"      Ignore this if your RAM already runs at its rated speed.")
+                print(f"      (In Issue #17, decode scaled ~+45-50% from 2133 -> 3200 MT/s.)")
     print("=" * 78)
 
 

@@ -105,6 +105,21 @@ else
     fi
 fi
 
+VULKAN_OPT="${GGML_VULKAN:-OFF}"
+CUDA_OPT="${GGML_CUDA:-OFF}"
+case "$VULKAN_OPT" in
+    OFF|off|0|FALSE|false|NO|no|"") ;;
+    *) echo "[*] Enabling Vulkan GPU backend (-DGGML_VULKAN=${VULKAN_OPT})..." ;;
+esac
+case "$CUDA_OPT" in
+    OFF|off|0|FALSE|false|NO|no|"") ;;
+    *) echo "[*] Enabling CUDA GPU backend (-DGGML_CUDA=${CUDA_OPT})..." ;;
+esac
+CMAKE_ISA_ARGS+=(
+    -DGGML_VULKAN="${VULKAN_OPT}"
+    -DGGML_CUDA="${CUDA_OPT}"
+)
+
 echo "[*] Configuring CMake build in ${BUILD_DIR}..."
 cmake -S "$LLAMA_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \

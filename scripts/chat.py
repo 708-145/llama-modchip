@@ -97,6 +97,24 @@ def detect_active_model(base_url: str) -> Tuple[str, str, str]:
     except Exception:
         pass
 
+    # If llama-server was started with --alias, /v1/models returns the alias rather than the GGUF filename;
+    # inspect /props (or local backend :8789/props) to recover the actual GGUF checkpoint path.
+    if not raw_id.lower().endswith(".gguf"):
+        prop_urls = [f"{base_url}/props"]
+        if ":8787" in base_url:
+            prop_urls.append(base_url.replace(":8787", ":8789") + "/props")
+        for purl in prop_urls:
+            try:
+                req = urllib.request.Request(purl, method="GET")
+                with urllib.request.urlopen(req, timeout=0.8) as resp:
+                    pdata = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    mpath = pdata.get("model_path") or ""
+                    if mpath and mpath.lower().endswith(".gguf"):
+                        raw_id = mpath
+                        break
+            except Exception:
+                pass
+
     base_name = os.path.basename(raw_id)
     base_clean = re.sub(r"-0000\d-of-0000\d\.gguf$|\.gguf$", "", base_name, flags=re.IGNORECASE)
     low = base_clean.lower()
@@ -686,10 +704,28 @@ def run_benchmark_suite(base_url: str) -> None:
     print_turn_telemetry(s2)
 
     pp_best = max(s1["pp_tps"], s2["pp_tps"])
-    s2_spec = f"{s2['acc_pct']:.1f}% ({s2['draft_acc']}/{s2['draft_n']})" if s2["draft_n"] > 0 else "Active"
+    if s2["draft_n"] > 0:
+        s2_spec_note = f"Stockfish-PVS Acceptance: {s2['acc_pct']:.1f}% ({s2['draft_acc']}/{s2['draft_n']})"
+    else:
+        s2_spec_note = "Speculative: disabled / 0 drafts"
+
+    git_rev = ""
+    try:
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        git_rev = subprocess.check_output(
+            ["git", "-C", repo_dir, "rev-parse", "--short=7", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        pass
+    ver_tag = f"v2.4 ({git_rev})" if git_rev else "v2.4"
+    banner_text = f"🚀 LLAMA-MODCHIP {ver_tag} BENCHMARK SCORECARD (Share on GitHub / X!)"
+    vis_w = sum(2 if ord(ch) > 0xFFFF else 1 for ch in banner_text)
+    banner_line = f"║ {banner_text}{' ' * max(1, 83 - vis_w)}║"
 
     print(f"\n{BOLD}{GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.4 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
+    print(f"{BOLD}{GREEN}{banner_line}{RESET}")
     print(f"{BOLD}{GREEN}╠════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
     print(f"  Hardware            : {hw_scorecard}")
     aff_note = get_server_affinity_summary(base_url)
@@ -698,7 +734,7 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"  Active Model        : {model_display}")
     print(f"  Prompt Prefill      : {pp_best:.2f} tok/s")
     print(f"  Decode (New C++20)  : {s1['dec_tps']:.2f} tok/s (TTFT: {s1['ttft_ms']:.0f} ms)")
-    print(f"  Decode (Refactor)   : {s2['dec_tps']:.2f} tok/s (Stockfish-PVS Acceptance: {s2_spec})")
+    print(f"  Decode (Refactor)   : {s2['dec_tps']:.2f} tok/s ({s2_spec_note})")
     print(f"{BOLD}{GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
     print(f"👉 Share your CPU scorecard: {CYAN}https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml{RESET}\n")
 
