@@ -43,6 +43,30 @@ All three quantization profiles (`Baseline-Q4_0`, `Fractal-MXFP4`, and `Fractal-
 | **Multi-Turn In-Context Refactoring (`Stockfish-PVS M=7`)** | `40.91 tok/s` | **`48.39–60.40 tok/s`** | **`48.39–60.40 tok/s`** | **`96.39%` draft acceptance** |
 | **Idle / Peak Resident RAM (`VmRSS` @ `256K` Context)** | `21.41 / 21.71 GiB` | `17.46 / 18.86 GiB` | **`15.40 / 17.27 GiB`** | **`-6.01 GiB` idle RAM saved** |
 
+### 3.1 Empirical Paired KL-Divergence & Logit Fidelity (`Q4_0` Reference Baseline)
+
+Independent paired evaluation conducted by `@khairullinr` on an Apple M4 Max (`36 GB` LPDDR5X-8533, Metal) using `llama-perplexity --kl-divergence` on a Python source-code corpus (`12` chunks × `2048` ctx, `~12.3k` scored tokens, `-ngl 99 -fa 1 -b 256 -ub 256`, [Issue #16](https://github.com/synchopate/llama-modchip/issues/16#issuecomment-6752457578)):
+
+- **Reference Model**: `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf` (`17.59 GiB`, nominal `4.50 bpw`). Note this measures fidelity relative to `Q4_0`, not unquantized `BF16`.
+- **Target Quantization**: `Fractal-64-BF16` (`14.35 GiB`, nominal `3.75 bpw`, `-18.42%` file footprint).
+- **Top-1 (Argmax) Token Agreement**: **`94.347 ± 0.208%`** (reported as `Same top p` by `llama-perplexity`). In ~19 out of 20 token positions, `Fractal-64` selects the exact same greedy token as the `Q4_0` baseline.
+- **Kullback-Leibler Divergence (KLD)**:
+  - **Mean KLD**: **`0.056606 ± 0.001964 nats`**
+  - **90th Percentile KLD**: **`0.139480 nats`**
+  - **95th Percentile KLD**: **`0.280968 nats`**
+  - **99th Percentile KLD**: **`0.845352 nats`**
+  - **Median KLD**: **`0.000829 nats`**
+  - *Distribution profile*: On the vast majority of tokens, the predicted logit distributions are nearly identical (median KLD `< 0.001 nats`), with divergence concentrated in a tail of roughly 5–10% of positions.
+- **Per-Token Log-Likelihood Correlation**: **`97.28%`** (`Cor(ln PPL(Q), ln PPL(base))`).
+- **Paired Perplexity & Probability Shifts**:
+  - **Mean PPL(base)**: `2.082848 ± 0.037092`
+  - **Mean PPL(Q)**: `2.123941 ± 0.039133`
+  - **Mean Paired $\ln(\text{PPL}(Q)/\text{PPL}(\text{base}))$**: `0.019537 ± 0.004266` (**`+1.97%`**)
+  - **Mean Paired $\text{PPL}(Q) - \text{PPL}(\text{base})$**: `0.041092 ± 0.009110`
+  - **Median $\Delta p$**: **`-0.000%`** (indicating no systematic probability bias)
+  - **RMS $\Delta p$**: **`8.133 ± 0.197%`**
+- *Methodological Caveats*: Single Python code corpus (which has low entropy, making median KLD and top-1 agreement look favorable compared to open prose); tokens within context windows are correlated, so true asymptotic variance may exceed i.i.d. estimates.
+
 ---
 
 ## 4. Quick Commands for Nemotron
