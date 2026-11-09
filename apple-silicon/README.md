@@ -209,3 +209,32 @@ The gateway still has these upstream behaviours. Know them before you use it:
   Claude Code asks for Bash permission and shows no file diff.
 - It allows a maximum of 2 tool calls per turn and limits `max_tokens` to 4096.
 - It replaces the full Claude Code system prompt with the short gateway prompt.
+
+## DeepSeek-V4-Flash 284B on Apple Silicon (M5 Max 64 GB)
+
+Contributed by Bobby Grayson ([`@notactuallytreyanastasio`](https://github.com/notactuallytreyanastasio)), this repository includes full support, build automation, Metal/NEON kernels, and memory mapping optimizations for running the **`DeepSeek-V4-Flash-0731-Fractal` (284B, 56.56 GiB)** model on Apple Silicon Macs.
+
+### Key Performance Highlights (Apple M5 Max 64 GB)
+- **`llama-bench` (`tg128`)**: **`27.0 ± 0.4 tok/s`** (`pp512`: **`169.4 ± 29.6 tok/s`**)
+- **`llama-server` (Realistic Workloads)**: **`20.7 – 23.6 tok/s`** served with **`0` swapouts** (`code_edit`: 20.7 t/s, `code_new`: 23.3 t/s, `free_text`: 23.6 t/s).
+- Detailed report and profiling data: [`apple-silicon/results/dsv4-m5max.md`](results/dsv4-m5max.md).
+
+### The Five Engineering Fixes for Apple Silicon
+1. **Pinned Upstream Commit**: `patches/dsv4-64gb-cpu.patch` matches llama.cpp commit `d2f83055` (2026-08-10, recovered from the 18 pre-image blob hashes in the patch). Automated worktree setup is handled in [`build-dsv4-engine.sh`](build-dsv4-engine.sh).
+2. **Fractal-64 Q2_0 NEON & Metal Kernels**: [`patches/apple-silicon/0001-fractal64-q2_0-arm64-metal.patch`](../patches/apple-silicon/0001-fractal64-q2_0-arm64-metal.patch) rewrites `block_q2_0` (30 bytes: `d`, `scales[4]`, `qs[16]`, `qh[8]`, 3.75 bpw) for ARM64 NEON with dotprod (`vqtbl1q_s8` + `vdotq_s32`) and Metal shaders, resolving undefined symbol link failures off x86 and passing 45/45 `test-backend-ops` MUL_MAT tests (with the scalar reference validated in `test-quantize-fns`).
+3. **Metal Host-Pointer Run Mapping**: [`patches/apple-silicon/0002-metal-map-tensor-runs.patch`](../patches/apple-silicon/0002-metal-map-tensor-runs.patch) wraps only contiguous runs of GPU-resident tensors in Metal host-pointer buffers (`newBufferWithBytesNoCopy`, merging gaps < 16 MiB) instead of wrapping the entire mapped file. This prevents CPU-routed experts from exhausting Metal's recommended max working set limit and eliminates `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+4. **Metal Register Unpack & Computed LUT**: [`patches/apple-silicon/0003-metal-q2_0-register-unpack.patch`](../patches/apple-silicon/0003-metal-q2_0-register-unpack.patch) unpacks 30-byte blocks using 32-bit word loads via ushort pairs and computes `kvalues_fractal3` directly to avoid SIMD warp-divergent constant memory stalls.
+5. **Layer Placement Strategy**: Offloading 5 alternating middle pure-`IQ1_S` layers (`blk.(10|12|14|16|18).ffn_.*_exps.=CPU`) to CPU doubles decode speed from 13.6 tok/s (naive sequential `--n-cpu-moe 4`) to **27.0 tok/s** in `llama-bench` (`tg128`).
+
+### Building and Running
+```bash
+# 1. Build the engine (clones/worktrees llama.cpp d2f83055 and applies patches)
+./apple-silicon/build-dsv4-engine.sh
+
+# 2. Run with fast profile (requires 64 GB Mac + sudo sysctl iogpu.wired_limit_mb=57344)
+./apple-silicon/run-dsv4.sh
+
+# Or run with nosudo profile (fits default 53 GB Metal working set)
+PROFILE=nosudo ./apple-silicon/run-dsv4.sh
+```
+

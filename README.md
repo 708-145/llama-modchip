@@ -195,6 +195,13 @@ Full ablation tables and `100/100` Quality Gate report in **[`docs/NEMOTRON_OPTI
 | **`Fractal-MXFP4` (`4.25 bpw`)** | `15.95 GiB` | `17.46 GiB` | **`100.0 / 100.0`** | `241.0 – 306.8 tok/s` | **`26.08 tok/s` (`+33.5%`)** | **`48.39 avg / 60.40 peak tok/s`** *(`80.8` Vulkan)* |
 | **`Fractal-64-BF16` (`3.75 bpw`)** | **`14.35 GiB`** | **`15.40 GiB` (`-6.01 GiB`)** | **`100.0 / 100.0`** | `241.0 – 306.8 tok/s` | **`25.02 tok/s` (`+28.0%`)** | **`48.39 avg / 60.40 peak tok/s`** *(`96.4%` acc)* |
 
+### 3. `DeepSeek-V4-Flash 284B` (`13.17B` Active) on Apple Silicon (`Apple M5 Max`, `64 GB Unified Memory`)
+- **Prefill Throughput (`pp512`)**: **`169.4 ± 29.6 tok/s`** (Apple Metal accelerated)
+- **Decode Throughput (`tg128`)**: **`27.0 ± 0.4 tok/s`** in `llama-bench`
+- **Real Served Generation (`llama-server`)**: **`20.7 – 23.6 tok/s`** across realistic coding (`code_edit`: `20.7 tok/s`, `code_new`: `23.3 tok/s`, `free_text`: `23.6 tok/s`) with **`0` swapouts** (`iogpu.wired_limit_mb=57344`)
+- **Architecture & Placement**: Apple M5 Max (18-Core CPU + 40-Core Metal GPU), 64 GB LPDDR5X. 5 pure-`IQ1_S` MoE layers offloaded to CPU (`blk.(10|12|14|16|18).ffn_.*_exps.=CPU`), remainder on Metal.
+- **Driver & Patches**: `patches/apple-silicon/0001` (Fractal-64 Q2_0 NEON/Metal), `0002` (Metal tensor run mapping), `0003` (Metal register unpack). Built via [`apple-silicon/build-dsv4-engine.sh`](apple-silicon/build-dsv4-engine.sh) and launched with [`apple-silicon/run-dsv4.sh`](apple-silicon/run-dsv4.sh). Contributed by Bobby Grayson ([`@notactuallytreyanastasio`](https://github.com/notactuallytreyanastasio)). Full report: [`apple-silicon/results/dsv4-m5max.md`](apple-silicon/results/dsv4-m5max.md).
+
 ---
 
 ## Community CPU & Hybrid Leaderboard
@@ -206,8 +213,9 @@ Run **`./modchip bench`** (or **`windows\BENCHMARK_PC.bat`** on Windows) and **[
 | **AMD Threadripper PRO 7985WX (`Zen 4`)** | `64C/128T` (`8 CCDs`, `256 MB` L3) | `256 GB` 8-Ch DDR5-6000 (`0 GPU`) | **`386.00`** *(`-t 32`)* | **`73.84 – 80.14 tok/s`** *(`70.0%` acc)* | **`111.62 tok/s` warm** / **`80.14` cold** *(`-t 32` 4C/CCD)* | `@aifartist` ([Issue #1](https://github.com/synchopate/llama-modchip/issues/1#issuecomment-6595559921)) |
 | **AMD Ryzen 9 7945HX3D + RX 9070 XT (`Hybrid`)** | `16C/32T` (`128 MB` 3D V-Cache) + `16 GB` Vulkan | `94 GB` DDR5 + `16 GB` VRAM | **`563.00`** *(256K ctx)* | **`75.10 tok/s`** *(`MXFP4` 15.2GB)* | **`80.80 tok/s`** *(Vulkan `SSM_SCAN` + `MXFP4` MoE)* | `Community (RADV/Vulkan)` ([`FAQ.md`](FAQ.md)) |
 | **AMD Ryzen 9 9955HX (`Zen 5`)** | `16C/32T` (`2 CCDs`, `64 MB` L3) | `64 GB` DDR5 (`0 GPU`) | **`241.0`** *(Peak **`306.8`**)* | **`25.02 – 34.5 tok/s`** *(`Fractal-64` / `MXFP4`)* | **`48.39 avg / 60.40 peak`** *(`len 6.90`)* | `@synchopate` ([`docs/NEMOTRON_OPTIMIZATIONS.md`](docs/NEMOTRON_OPTIMIZATIONS.md)) |
-| **Apple M4 Max (`14C+32C Metal` · `Q4_0`)** | `ARM64 NEON` + `Metal` | `36 GB` LPDDR5X-8533 (`Unified`) | **`860.13`** *(`1,040.2` `pp512`)* | **`77.23 tok/s`** *(C++20, `203 ms` TTFT; `80.3` `tg128`)* | **`77.95 tok/s`** *(`81.0` short, `69.9` @ 32K)* | `@khairullinr` ([Issue #16](https://github.com/synchopate/llama-modchip/issues/16#issuecomment-6750666568)) |
-| **Apple M4 Max (`14C+32C Metal` · `Fractal-64`)** | `ARM64 NEON` + `Metal` | `36 GB` LPDDR5X-8533 (`Unified`) | **`615.89`** *(`979.9` `pp512`)* | **`71.60 tok/s`** *(C++20, `47 ms` TTFT; `72.5` `tg128`)* | **`71.31 tok/s`** *(no spec, `14.35 GiB`)* | `@khairullinr` ([Issue #16](https://github.com/synchopate/llama-modchip/issues/16#issuecomment-6749995036)) |
+| **Apple M4 Max (`14C+32C Metal` · `Q4_0`)** | `ARM64 NEON` + `Metal` | `36 GB` LPDDR5X-8533 (`Unified`) | **`860.13`** *(`1,040.2` `pp512`)* | **`77.23 tok/s`** *(C++20, `203 ms` TTFT; `80.34` `tg128`)* | **`77.95 tok/s`** *(`81.0` short; Nemotron 30B PPL `2.086 ± 0.037`, Gate `100/100`)* | `@khairullinr` ([Issue #16](https://github.com/synchopate/llama-modchip/issues/16#issuecomment-6751407859)) |
+| **Apple M4 Max (`14C+32C Metal` · `Fractal-64`)** | `ARM64 NEON` + `Metal` | `36 GB` LPDDR5X-8533 (`Unified`) | **`615.89`** *(`979.9` `pp512`)* | **`71.60 tok/s`** *(C++20, `47 ms` TTFT; `72.47` `tg128`)* | **`71.31 tok/s`** *(PPL `2.124 ± 0.039` [`+1.8%`], Gate `100/100` [80 Quality + 20 Speed])* | `@khairullinr` ([Issue #16](https://github.com/synchopate/llama-modchip/issues/16#issuecomment-6751407859)) |
+| **Apple M5 Max (`DeepSeek-V4 284B` · `56.56 GiB`)** | `18C CPU` + `40C Metal` | `64 GB` LPDDR5X (`286.5 GB/s` BW) | **`169.40`** *(`pp512`)* | **`27.00 tok/s`** *(`llama-bench` `tg128`)* | **`20.70 – 23.60 tok/s`** *(`llama-server`, `0` swapouts)* | `@notactuallytreyanastasio` ([`dsv4-m5max.md`](apple-silicon/results/dsv4-m5max.md)) |
 | **Apple M4 Max (`16C CPU + 40C GPU`)** | `16C` (`ARM64 NEON` + `40C Metal`) | `64 GB` LPDDR5X-8533 (`238.9 GB/s` BW) | **`~451.0`** *(Audit)* | **`49.2 – 57.7 tok/s`** *(Prose / Code)* | **`70.9 – 120.0 tok/s`** *(Agent / Refactor)* | `@jbeckman1974` ([Issue #8](https://github.com/synchopate/llama-modchip/issues/8)) |
 | **Apple M4 Pro (`14-Core SoC`)** | `14C CPU + 20C Metal` | `24 GB` Unified (`0 Swap`) | **`256.0 – 549.0`** | **`47.0 – 48.0 tok/s`** *(128K)* | **`49.0+ tok/s`** | `@jarorosFork` ([`apple-silicon/`](apple-silicon/README.md)) |
 | **AWS Graviton3 `m7g.2xlarge` (`ARM64 Neoverse-V1`)** | `8 vCPU` (`32 MB` L3, `SVE-256`) | `31 GB` DDR5 (`0 GPU`) | **`101.67`** *(`-t 8`)* | **`41.05 tok/s`** *(C++20)* | **`44.97 tok/s`** *(Refactoring)* | `@gerchik` ([Issue #2](https://github.com/synchopate/llama-modchip/issues/2)) |
@@ -242,10 +250,12 @@ llama-modchip/
 │   ├── DEEPSEEK_V4_OPTIMIZATIONS.md           # Deep-dive on DeepSeek-V4-Flash 284B profiling, SVD & L2-quadrature MoE
 │   └── HARDWARE_OPTIMIZATIONS.md              # Chip-by-chip optimizations (Zen 5, Threadripper, Vulkan, CUDA, Metal, ARM64)
 ├── patches/
+│   ├── apple-silicon/                         # Apple Silicon engine patches (Fractal-64 Q2_0 NEON/Metal, host-ptr run mapping, register unpack)
 │   ├── deepseek-v4-flash-fractal-256k.patch   # Unified v2.4.0 patch (DeepSeek-V4-Flash 284B + Nemotron-3.5 30B, Linux/macOS/Windows)
+│   ├── dsv4-64gb-cpu.patch                    # DeepSeek-V4-Flash 284B CPU engine patch (llama.cpp d2f83055 base)
 │   └── zen5-nemotron-256k-optimizations.patch # Standalone ggml/llama core patch for Nemotron-3.5
 ├── windows/                                   # Windows 10/11 Hybrid GPU+CPU MoE Pack (AVVIA_MODCHIP.bat, modchip_win.ps1)
-├── apple-silicon/                             # Apple M4 Pro (24 GB) Metal setup & 128K benchmarks
+├── apple-silicon/                             # Apple Silicon M4/M5 setup scripts (build-dsv4-engine.sh, run-dsv4.sh, M5 Max benchmarks & docs)
 ├── fedora/                                    # Fedora 44 / AMD Ryzen 7 8745HS (GEEKOM A8) all-in-one script
 ├── speculative/                               # RouteCrack + Stockfish-PVS v2 (rc_stockfish.h, ngram-map.cpp)
 ├── benchmarks/                                # eval_quality_and_tools.py (100-pt Quality Gate) & results/*.json
