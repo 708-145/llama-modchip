@@ -1,0 +1,333 @@
+From f3b15fab0f157ad32c402547c9d0d5719029def3 Mon Sep 17 00:00:00 2001
+From: Bobby Grayson <bobbbygrayson+github@gmail.com>
+Date: Sun, 8 Nov 2026 20:50:52 -0500
+Subject: [PATCH] Make Fractal-64 Q2_0 build and compute correctly on arm64 and
+ Metal
+
+The modchip patch changes block_q2_0 to 30 bytes (d, scales[4], qs[16],
+qh[8]) but leaves the upstream ARM NEON and Metal Q2_0 kernels decoding
+the old 18-byte 2-bit layout. Those still compile, because d and qs keep
+their names and qs is still 16 bytes, so on a Mac every Q2_0 matmul
+(2.14 GiB of DeepSeek-V4-Flash-0731-Fractal) silently returns wrong values.
+
+test-backend-ops -b MTL0 -o MUL_MAT -p q2_0, Metal vs CPU:
+  upstream Metal kernels:  0/45 tests passed
+  this commit:            45/45   (MUL_MAT_ID 75/75, GET_ROWS 4/4, CPY 2/2)
+
+Metal: dequantize_q2_0, dequantize_q2_0_t4 and block_q_n_dot_y(q2_0) are
+rewritten for the new layout. mul_mm, mul_mm_id, mul_mv_id, mul_mv_ext,
+get_rows and cpy all instantiate from these three. F32 -> Q2_0 CPY is
+dropped from supports_op, because quantize_q2_0 still writes the old format.
+This is a correctness port: it does two device byte loads per weight.
+
+arm64 CPU: ggml_vec_dot_q2_0_q8_0 is a new NEON/dotprod kernel for the
+Fractal-64 layout (test-quantize-fns q2_0 dot error 0.014803, same as the
+scalar reference). Compared with routing to the scalar generic kernel, it
+doubled DeepSeek decode from 4.2 to 8.4 tok/s with layers 0-7 on CPU.
+
+ggml_get_vec_dot_multi() now returns NULL off x86, so callers use the
+per-column vec_dot. The 1xN tile kernels exist only in arch/x86/quants.c,
+and without this libggml-cpu fails to link on arm64.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cpu/arch/arm/quants.c     | 103 ++++++++++--------------
+ ggml/src/ggml-cpu/ggml-cpu.c            |   6 ++
+ ggml/src/ggml-metal/ggml-metal-device.m |   1 -
+ ggml/src/ggml-metal/ggml-metal.metal    | 103 ++++++++++--------------
+ 4 files changed, 91 insertions(+), 122 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index b988abf9..c2b576a5 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -220,78 +220,63 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ }
+ 
+ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+-    const int qk = QK2_0;
+-    const int nb = n / qk;
+-
+-    assert(n % qk == 0);
++    // modchip Fractal-64 layout (30 bytes): d, scales[4], qs[16], qh[8].
++    // weight j = g*16 + k:  idx = ((qs[k] >> 2g) & 3) | (((qh[k&7] >> (2g + (k>>3))) & 1) << 2)
++    //                       w   = d * (4 + nibble(sub-block j>>3)) * kvalues_fractal3[idx]
++#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++    const int nb = n / QK2_0;
++    assert(n % QK2_0 == 0);
+     assert(nrc == 1);
+-    UNUSED(nrc);
+-    UNUSED(bx);
+-    UNUSED(by);
+-    UNUSED(bs);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+ 
+     const block_q2_0 * GGML_RESTRICT x = vx;
+     const block_q8_0 * GGML_RESTRICT y = vy;
+ 
+-    float sumf = 0.0f;
+-
+-#if defined(__ARM_NEON)
+-    // Replicate pattern: each byte repeated 4 times
+-    static const uint8_t tbl_idx_lo[16] = {0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3};
+-    static const uint8_t tbl_idx_hi[16] = {4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7};
+-    // Right-shift amounts: 0,2,4,6 repeated for each group of 4
+-    static const int8_t shift_vals[16] = {0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6};
+-
+-    const uint8x16_t idx_lo  = vld1q_u8(tbl_idx_lo);
+-    const uint8x16_t idx_hi  = vld1q_u8(tbl_idx_hi);
+-    const int8x16_t  shifts  = vld1q_s8(shift_vals);
+-    const uint8x16_t mask2   = vdupq_n_u8(0x03);
+-    const int8x16_t  one     = vdupq_n_s8(1);
+-
+-    float32x4_t sumv = vdupq_n_f32(0.0f);
++    static const int8_t kv[16] = { -14, -8, -4, -1, 1, 4, 8, 14, 0, 0, 0, 0, 0, 0, 0, 0 };
++    const int8x16_t  lut   = vld1q_s8(kv);
++    const uint8x16_t m3    = vdupq_n_u8(3);
++    const uint8x16_t m1    = vdupq_n_u8(1);
++    // per-lane right shifts for qh: k<8 -> 2g, k>=8 -> 2g+1 (vshlq with negative = right shift)
++    static const int8_t sh0[16] = { 0, 0, 0, 0, 0, 0, 0, 0, -1,-1,-1,-1,-1,-1,-1,-1 };
++    const int8x16_t  shbase = vld1q_s8(sh0);
+ 
++    float sumf = 0.0f;
+     for (int i = 0; i < nb; i++) {
+-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+-
+-        // group 64: one Q2_0 block (64 weights) maps to two Q8_0 blocks (2 * 32 = 64)
+-        for (int k = 0; k < 2; k++) {
+-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+-
+-            // Load 8 bytes of packed 2-bit values
+-            const uint8x8_t raw = vld1_u8(&x[i].qs[k * 8]);
+-            const uint8x16_t raw16 = vcombine_u8(raw, raw);
+-
+-            // First 16 elements: replicate bytes 0-3, shift, mask, subtract 1
+-            uint8x16_t bytes0 = ggml_vqtbl1q_u8(raw16, idx_lo);
+-            int8x16_t qv0 = vsubq_s8(
+-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
+-                one);
+-
+-            // Second 16 elements: replicate bytes 4-7, shift, mask, subtract 1
+-            uint8x16_t bytes1 = ggml_vqtbl1q_u8(raw16, idx_hi);
+-            int8x16_t qv1 = vsubq_s8(
+-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
+-                one);
+-
+-            // Load Q8_0 values and dot product
+-            const int8x16_t y0 = vld1q_s8(yb->qs);
+-            const int8x16_t y1 = vld1q_s8(yb->qs + 16);
++        const uint8x16_t qs   = vld1q_u8(x[i].qs);
++        const uint8x8_t  qh8  = vld1_u8(x[i].qh);
++        const uint8x16_t qh16 = vcombine_u8(qh8, qh8);
++        const uint8_t * sc = x[i].scales;
++
++        int32x4_t acc0 = vdupq_n_s32(0); // groups 0,1 -> y[2i]
++        int32x4_t acc1 = vdupq_n_s32(0); // groups 2,3 -> y[2i+1]
++
++#define Q2_0_GROUP(G, ACC, YQS)                                                                   \
++        {                                                                                         \
++            const uint8x16_t lo2 = vandq_u8(vshlq_u8(qs, vdupq_n_s8(-2*(G))), m3);                           \
++            const uint8x16_t hi1 = vandq_u8(vshlq_u8(qh16, vaddq_s8(shbase, vdupq_n_s8(-2*(G)))), m1); \
++            const uint8x16_t idx = vorrq_u8(lo2, vshlq_n_u8(hi1, 2));                             \
++            const int8x16_t  w   = vqtbl1q_s8(lut, idx);                                          \
++            const int32x4_t  p   = ggml_vdotq_s32(vdupq_n_s32(0), w, vld1q_s8(YQS));              \
++            const int32_t m_lo = 4 + (((G) < 2) ? (sc[2*(G)    ] & 0x0F) : (sc[2*(G) - 4] >> 4));  \
++            const int32_t m_hi = 4 + (((G) < 2) ? (sc[2*(G) + 1] & 0x0F) : (sc[2*(G) - 3] >> 4));  \
++            const int32_t mv[4] = { m_lo, m_lo, m_hi, m_hi };                                     \
++            ACC = vmlaq_s32(ACC, p, vld1q_s32(mv));                                               \
++        }
+ 
+-            int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), qv0, y0);
+-            int32x4_t p1 = ggml_vdotq_s32(p0, qv1, y1);
++        Q2_0_GROUP(0, acc0, y[2*i + 0].qs + 0);
++        Q2_0_GROUP(1, acc0, y[2*i + 0].qs + 16);
++        Q2_0_GROUP(2, acc1, y[2*i + 1].qs + 0);
++        Q2_0_GROUP(3, acc1, y[2*i + 1].qs + 16);
++#undef Q2_0_GROUP
+ 
+-            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p1), d0 * d1);
+-        }
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        sumf += d0 * (GGML_CPU_FP16_TO_FP32(y[2*i + 0].d) * (float)vaddvq_s32(acc0) +
++                      GGML_CPU_FP16_TO_FP32(y[2*i + 1].d) * (float)vaddvq_s32(acc1));
+     }
+-
+-    sumf = vaddvq_f32(sumv);
++    *s = sumf;
+ #else
+     ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+-    return;
+ #endif
+-
+-    *s = sumf;
+ }
+ 
+ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index c4658336..d527c656 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1265,6 +1265,12 @@ static inline void ggml_get_vec_dot_multi(
+     *out_1x4 = NULL;
+     *out_1x3 = NULL;
+     *out_1x2 = NULL;
++#if !(defined(__x86_64__) || defined(_M_X64))
++    // modchip: the 1xN register-tiled kernels exist only in arch/x86/quants.c.
++    // Elsewhere return NULL so callers use the per-column vec_dot from type_traits.
++    GGML_UNUSED(type);
++    return;
++#endif
+     switch (type) {
+         case GGML_TYPE_Q2_0:
+             *out_1x8 = ggml_vec_dot_q2_0_q8_0_1x8;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index df85ab02..1bb7aad0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1401,7 +1401,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                            case GGML_TYPE_BF16:
+                            case GGML_TYPE_Q8_0:
+                            case GGML_TYPE_Q1_0:
+-                           case GGML_TYPE_Q2_0:
+                            case GGML_TYPE_Q4_0:
+                            case GGML_TYPE_Q4_1:
+                            case GGML_TYPE_Q5_0:
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 92258b73..fa025de8 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -170,20 +170,32 @@ void dequantize_q1_0_t4(device const block_q1_0 * xb, short il, thread type4 & r
+     reg = (type4) reg_f;
+ }
+ 
++// modchip Fractal-64 Q2_0 (30-byte block): weight j = g*16 + k (g in 0..3, k in 0..15)
++//   idx  = ((qs[k] >> 2g) & 3) | (((qh[k & 7] >> (2g + (k >> 3))) & 1) << 2)
++//   mult = 4 + nibble of scales[] for sub-block j>>3 (0..3 low nibbles, 4..7 high nibbles)
++//   w    = d * mult * kvalues_fractal3[idx]
++constant float kvalues_fractal3_f[8] = { -14.f, -8.f, -4.f, -1.f, 1.f, 4.f, 8.f, 14.f };
++
++static inline float q2_0_fractal_mult(device const block_q2_0 * xb, short sb) {
++    const uint8_t sc = xb->scales[sb & 3];
++    return (float)(4 + ((sb < 4) ? (sc & 0x0F) : (sc >> 4)));
++}
++
++static inline float q2_0_fractal_val(device const block_q2_0 * xb, short g, short k) {
++    const uint8_t lo2 = (xb->qs[k] >> (2*g)) & 3;
++    const uint8_t hi1 = (xb->qh[k & 7] >> (2*g + (k >> 3))) & 1;
++    return kvalues_fractal3_f[lo2 | (hi1 << 2)];
++}
++
+ template <typename type4x4>
+ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+-    device const uint8_t * qs = xb->qs;
+-    const float d = xb->d;
++    const float d  = xb->d;
++    const float s0 = d * q2_0_fractal_mult(xb, 2*il + 0);
++    const float s1 = d * q2_0_fractal_mult(xb, 2*il + 1);
+ 
+-    const int byte_offset = il * 4;  // il*16 elements = il*4 bytes (4 elements per byte)
+     float4x4 reg_f;
+-
+-    for (int i = 0; i < 4; i++) {
+-        const uint8_t b = qs[byte_offset + i];
+-        reg_f[i][0] = ((float)((b >> 0) & 3) - 1.0f) * d;
+-        reg_f[i][1] = ((float)((b >> 2) & 3) - 1.0f) * d;
+-        reg_f[i][2] = ((float)((b >> 4) & 3) - 1.0f) * d;
+-        reg_f[i][3] = ((float)((b >> 6) & 3) - 1.0f) * d;
++    for (short k = 0; k < 16; k++) {
++        reg_f[k/4][k%4] = (k < 8 ? s0 : s1) * q2_0_fractal_val(xb, il, k);
+     }
+ 
+     reg = (type4x4) reg_f;
+@@ -191,14 +203,15 @@ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & re
+ 
+ template <typename type4>
+ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & reg) {
+-    const float d = xb->d;
+-    const uint8_t b = xb->qs[il];
++    // il in 0..15 selects weights 4*il .. 4*il+3
++    const short g  = il / 4;
++    const short k0 = (il % 4) * 4;
++    const float s  = (float)xb->d * q2_0_fractal_mult(xb, 2*g + (k0 >> 3));
+ 
+     float4 reg_f;
+-    reg_f[0] = ((float)((b >> 0) & 3) - 1.0f) * d;
+-    reg_f[1] = ((float)((b >> 2) & 3) - 1.0f) * d;
+-    reg_f[2] = ((float)((b >> 4) & 3) - 1.0f) * d;
+-    reg_f[3] = ((float)((b >> 6) & 3) - 1.0f) * d;
++    for (short t = 0; t < 4; t++) {
++        reg_f[t] = s * q2_0_fractal_val(xb, g, k0 + t);
++    }
+ 
+     reg = (type4) reg_f;
+ }
+@@ -3359,53 +3372,19 @@ inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thre
+     return qb_curr->d * (2.0f * acc - sumy);
+ }
+ 
+-// Q2_0 dot: d * (sum_lo(y) + 2*sum_hi(y) - sumy) via per-bit conditional adds
++// modchip Fractal-64 Q2_0 dot over the 16 weights of group g = il/16 (sumy unused)
+ inline float block_q_n_dot_y(device const block_q2_0 * qb_curr, float sumy, thread float * yl, int il) {
+-    device const uint8_t * qs = qb_curr->qs + (il / 4);
+-    const uint8_t b0 = qs[0];
+-    const uint8_t b1 = qs[1];
+-    const uint8_t b2 = qs[2];
+-    const uint8_t b3 = qs[3];
+-
+-    // Accumulate where low bit is set (bits 0,2,4,6 of each byte)
+-    float acc_lo = 0.0f;
+-    acc_lo += select(0.0f, yl[ 0], bool(b0 & 0x01));
+-    acc_lo += select(0.0f, yl[ 1], bool(b0 & 0x04));
+-    acc_lo += select(0.0f, yl[ 2], bool(b0 & 0x10));
+-    acc_lo += select(0.0f, yl[ 3], bool(b0 & 0x40));
+-    acc_lo += select(0.0f, yl[ 4], bool(b1 & 0x01));
+-    acc_lo += select(0.0f, yl[ 5], bool(b1 & 0x04));
+-    acc_lo += select(0.0f, yl[ 6], bool(b1 & 0x10));
+-    acc_lo += select(0.0f, yl[ 7], bool(b1 & 0x40));
+-    acc_lo += select(0.0f, yl[ 8], bool(b2 & 0x01));
+-    acc_lo += select(0.0f, yl[ 9], bool(b2 & 0x04));
+-    acc_lo += select(0.0f, yl[10], bool(b2 & 0x10));
+-    acc_lo += select(0.0f, yl[11], bool(b2 & 0x40));
+-    acc_lo += select(0.0f, yl[12], bool(b3 & 0x01));
+-    acc_lo += select(0.0f, yl[13], bool(b3 & 0x04));
+-    acc_lo += select(0.0f, yl[14], bool(b3 & 0x10));
+-    acc_lo += select(0.0f, yl[15], bool(b3 & 0x40));
+-
+-    // Accumulate where high bit is set (bits 1,3,5,7 of each byte)
+-    float acc_hi = 0.0f;
+-    acc_hi += select(0.0f, yl[ 0], bool(b0 & 0x02));
+-    acc_hi += select(0.0f, yl[ 1], bool(b0 & 0x08));
+-    acc_hi += select(0.0f, yl[ 2], bool(b0 & 0x20));
+-    acc_hi += select(0.0f, yl[ 3], bool(b0 & 0x80));
+-    acc_hi += select(0.0f, yl[ 4], bool(b1 & 0x02));
+-    acc_hi += select(0.0f, yl[ 5], bool(b1 & 0x08));
+-    acc_hi += select(0.0f, yl[ 6], bool(b1 & 0x20));
+-    acc_hi += select(0.0f, yl[ 7], bool(b1 & 0x80));
+-    acc_hi += select(0.0f, yl[ 8], bool(b2 & 0x02));
+-    acc_hi += select(0.0f, yl[ 9], bool(b2 & 0x08));
+-    acc_hi += select(0.0f, yl[10], bool(b2 & 0x20));
+-    acc_hi += select(0.0f, yl[11], bool(b2 & 0x80));
+-    acc_hi += select(0.0f, yl[12], bool(b3 & 0x02));
+-    acc_hi += select(0.0f, yl[13], bool(b3 & 0x08));
+-    acc_hi += select(0.0f, yl[14], bool(b3 & 0x20));
+-    acc_hi += select(0.0f, yl[15], bool(b3 & 0x80));
+-
+-    return qb_curr->d * (acc_lo + 2.0f * acc_hi - sumy);
++    const short g = il / 16;
++    float acc0 = 0.0f;
++    float acc1 = 0.0f;
++    FOR_UNROLL (short k = 0; k < 8; k++) {
++        acc0 += q2_0_fractal_val(qb_curr, g, k) * yl[k];
++    }
++    FOR_UNROLL (short k = 8; k < 16; k++) {
++        acc1 += q2_0_fractal_val(qb_curr, g, k) * yl[k];
++    }
++    return (float)qb_curr->d * (q2_0_fractal_mult(qb_curr, 2*g + 0) * acc0 +
++                                q2_0_fractal_mult(qb_curr, 2*g + 1) * acc1);
+ }
+ 
+ // function for calculate inner product between half a q4_0 block and 16 floats (yl), sumy is SUM(yl[i])
+-- 
+2.56.0
+
