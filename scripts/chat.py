@@ -208,12 +208,168 @@ def get_host_summary() -> Tuple[str, str, str]:
     return cpu, f"{ram_gib:.0f} GB", f"2MB THP: {hp_gib:.2f} GiB"
 
 
-def get_server_affinity_summary() -> str:
-    """Return active llama-server CPU affinity & LP-E filter note on Linux (empty if unavailable)."""
-    if platform.system() != "Linux":
+def _parse_cpu_list_fallback(spec: str):
+    out = set()
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            if lo_s.isdigit() and hi_s.isdigit():
+                out.update(range(int(lo_s), int(hi_s) + 1))
+        elif part.isdigit():
+            out.add(int(part))
+    return out
+
+
+def _format_cpu_list_fallback(cpus) -> str:
+    if not cpus:
         return ""
-    mask_str = ""
+    xs = sorted(set(cpus))
+    parts = []
+    start = prev = xs[0]
+    for c in xs[1:]:
+        if c == prev + 1:
+            prev = c
+        else:
+            parts.append(f"{start}-{prev}" if prev - start >= 2 else (f"{start},{prev}" if prev != start else f"{start}"))
+            start = prev = c
+    parts.append(f"{start}-{prev}" if prev - start >= 2 else (f"{start},{prev}" if prev != start else f"{start}"))
+    return ",".join(parts)
+
+
+def _read_proc_argv(pid: str) -> List[str]:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode("utf-8", errors="replace") for a in f.read().split(b"\x00") if a]
+    except OSError:
+        return []
+
+
+def _read_proc_environ(pid: str) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for item in f.read().split(b"\x00"):
+                if b"=" in item:
+                    k, v = item.split(b"=", 1)
+                    env[k.decode("utf-8", errors="replace")] = v.decode("utf-8", errors="replace")
+    except OSError:
+        pass
+    return env
+
+
+def _arg_value(argv: List[str], *names: str) -> str:
+    for i, a in enumerate(argv):
+        for n in names:
+            if a == n and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(n + "="):
+                return a.split("=", 1)[1]
+    return ""
+
+
+def _is_local_url(base_url: str) -> bool:
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = (urlparse(base_url).hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in ("localhost", "0.0.0.0", "::"):
+        return True
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return True
+    except ValueError:
+        pass
+    # Also recognize a local LAN/Tailscale GATEWAY_HOST started on this machine
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    gh_file = os.path.join(repo_root, "workspace", "run", "gateway_host")
+    gw_pid_file = os.path.join(repo_root, "workspace", "run", "gateway.pid")
+    try:
+        if os.path.isfile(gh_file) and os.path.isfile(gw_pid_file):
+            with open(gh_file, "r", encoding="utf-8") as f:
+                local_gh = f.readline().strip().lower()
+            with open(gw_pid_file, "r", encoding="utf-8") as f:
+                gw_pid = f.read().strip()
+            if local_gh and host == local_gh and gw_pid.isdigit():
+                gw_argv = _read_proc_argv(gw_pid)
+                if any("sse_gateway.py" in a for a in gw_argv):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def get_server_affinity_summary(base_url: str) -> str:
+    """Return active local llama-server CPU affinity across all threads + -t/-tb & LP-E status on Linux."""
+    if platform.system() != "Linux" or not _is_local_url(base_url):
+        return ""
+    import glob
+    from urllib.parse import urlparse
+
+    want_port = urlparse(base_url).port
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # If base_url points at a local sse_gateway.py instance, resolve its LLAMA_BACKEND_URL
+    gw_candidates: List[str] = []
+    gw_pid_file = os.path.join(repo_root, "workspace", "run", "gateway.pid")
+    try:
+        if os.path.isfile(gw_pid_file):
+            with open(gw_pid_file, "r", encoding="utf-8") as f:
+                gp = f.read().strip()
+                if gp.isdigit():
+                    gw_candidates.append(gp)
+    except OSError:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "sse_gateway.py"], text=True, stderr=subprocess.DEVNULL
+        )
+        for line in out.splitlines():
+            p = line.strip()
+            if p.isdigit() and p not in gw_candidates:
+                gw_candidates.append(p)
+    except Exception:
+        pass
+
+    for gp in gw_candidates:
+        gw_argv = _read_proc_argv(gp)
+        if not any("sse_gateway.py" in a for a in gw_argv):
+            continue
+        gw_env = _read_proc_environ(gp)
+        gw_port_s = gw_argv[-1] if gw_argv and gw_argv[-1].isdigit() else gw_env.get("GATEWAY_PORT", "8787")
+        if want_port and gw_port_s.isdigit() and int(gw_port_s) == want_port:
+            backend_url = gw_env.get("LLAMA_BACKEND_URL", "http://127.0.0.1:8789")
+            if not _is_local_url(backend_url):
+                return ""
+            want_port = urlparse(backend_url).port or 8789
+            break
+
+    parse_fn = _parse_cpu_list_fallback
+    format_fn = _format_cpu_list_fallback
+    dropped: List[int] = []
+    try:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from _cpu_topology import (
+            drop_l3less_cores,
+            enumerate_online_physical_cores,
+            format_cpu_list,
+            parse_cpu_list,
+        )
+
+        parse_fn = parse_cpu_list
+        format_fn = format_cpu_list
+        _, dropped = drop_l3less_cores(
+            enumerate_online_physical_cores(ignore_affinity=True), respect_env=False
+        )
+    except Exception:
+        pass
+
     pid_file = os.path.join(repo_root, "workspace", "run", "server.pid")
     pids: List[str] = []
     try:
@@ -222,45 +378,108 @@ def get_server_affinity_summary() -> str:
                 p = f.read().strip()
                 if p.isdigit():
                     pids.append(p)
-    except Exception:
+    except OSError:
         pass
-    if not pids:
-        try:
-            out = subprocess.check_output(
-                ["pgrep", "-n", "llama-server"], text=True, stderr=subprocess.DEVNULL
-            ).strip()
-            if out.isdigit():
-                pids.append(out)
-        except Exception:
-            pass
-    for pid in pids:
-        try:
-            with open(f"/proc/{pid}/status", "r", encoding="utf-8") as sf:
-                for sline in sf:
-                    if sline.startswith("Cpus_allowed_list:"):
-                        mask_str = sline.split(":", 1)[1].strip()
-                        break
-            if mask_str:
-                break
-        except Exception:
-            pass
-    dropped_note = ""
     try:
-        scripts_dir = os.path.dirname(os.path.abspath(__file__))
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        from _cpu_topology import drop_l3less_cores, enumerate_online_physical_cores
-
-        _, dropped = drop_l3less_cores(enumerate_online_physical_cores())
-        if dropped:
-            dropped_note = f" (excluded L3-less LP-E: {dropped})"
+        out = subprocess.check_output(
+            ["pgrep", "-f", "llama-server"], text=True, stderr=subprocess.DEVNULL
+        )
+        for line in out.splitlines():
+            p = line.strip()
+            if p.isdigit() and p not in pids:
+                pids.append(p)
     except Exception:
         pass
-    if mask_str:
-        return f"mask={mask_str}{dropped_note}"
-    if dropped_note:
-        return dropped_note.strip()
-    return ""
+
+    matched_pid = ""
+    matched_argv: List[str] = []
+    matched_env: Dict[str, str] = {}
+    for pid in pids:
+        argv = _read_proc_argv(pid)
+        if not argv or not os.path.basename(argv[0]).startswith("llama-server"):
+            continue
+        env_map = _read_proc_environ(pid)
+        srv_port = _arg_value(argv, "--port") or env_map.get("LLAMA_ARG_PORT", "") or "8080"
+        if want_port and srv_port.isdigit() and int(srv_port) != want_port:
+            continue
+        matched_pid = pid
+        matched_argv = argv
+        matched_env = env_map
+        break
+
+    if not matched_pid:
+        return ""
+
+    t_dec = _arg_value(matched_argv, "-t", "--threads") or matched_env.get("LLAMA_ARG_THREADS", "")
+    t_batch = _arg_value(matched_argv, "-tb", "--threads-batch") or matched_env.get("LLAMA_ARG_THREADS_BATCH", "")
+
+    per_task_sets = []
+    live_cpus = set()
+    try:
+        # Union Cpus_allowed_list across all threads (/proc/<pid>/task/*/status):
+        # /proc/<pid>/status alone only reflects thread 0, which OMP_PROC_BIND=close pins to cpu0.
+        task_paths = glob.glob(f"/proc/{matched_pid}/task/*/status") or [f"/proc/{matched_pid}/status"]
+        for spath in task_paths:
+            try:
+                with open(spath, "r", encoding="utf-8") as sf:
+                    for sline in sf:
+                        if sline.startswith("Cpus_allowed_list:"):
+                            tset = parse_fn(sline.split(":", 1)[1].strip())
+                            if tset:
+                                per_task_sets.append(tset)
+                                live_cpus.update(tset)
+                            break
+            except (OSError, ValueError):
+                pass
+    except OSError:
+        pass
+
+    if not live_cpus:
+        return ""
+
+    # If llama-server was started without `taskset`, idle HTTP threads retain the full host CPU mask
+    # while OpenMP compute threads bind to narrower core subsets once initialized.
+    max_t = max(
+        int(t_dec) if t_dec.isdigit() else 0,
+        int(t_batch) if t_batch.isdigit() else 0,
+    )
+    effective_cpus = live_cpus
+    if max_t > 1 and len(live_cpus) > max_t:
+        narrow_union = set()
+        for tset in per_task_sets:
+            if 0 < len(tset) < len(live_cpus):
+                narrow_union.update(tset)
+        if len(narrow_union) >= max_t:
+            effective_cpus = narrow_union
+
+    mask_str = format_fn(sorted(effective_cpus))
+    if not mask_str:
+        return ""
+
+    meta_parts: List[str] = []
+    if t_dec and t_batch and t_batch != t_dec:
+        meta_parts.append(f"-t {t_dec}/-tb {t_batch}")
+    elif t_dec:
+        meta_parts.append(f"-t {t_dec}")
+    elif t_batch:
+        meta_parts.append(f"-tb {t_batch}")
+
+    if dropped:
+        active_lpe = sorted(set(dropped) & effective_cpus)
+        if active_lpe:
+            if matched_env.get("MODCHIP_KEEP_NO_L3") == "1":
+                meta_parts.append(f"LP-E {active_lpe} kept via MODCHIP_KEEP_NO_L3=1")
+            elif matched_env.get("TASKSET_MASK", "").strip() and (
+                set(active_lpe) & parse_fn(matched_env["TASKSET_MASK"])
+            ):
+                meta_parts.append(f"LP-E {active_lpe} included via TASKSET_MASK")
+            else:
+                meta_parts.append(f"LP-E {active_lpe} active — run './modchip restart' to exclude")
+        else:
+            meta_parts.append(f"excluded L3-less LP-E: {dropped}")
+
+    meta_suffix = f" ({', '.join(meta_parts)})" if meta_parts else ""
+    return f"mask={mask_str}{meta_suffix}"
 
 
 def stream_chat_turn(
@@ -419,12 +638,22 @@ class HARPCacheRing:
 
 
 def run_benchmark_suite(base_url: str) -> None:
-    cpu, ram, hp = get_host_summary()
+    is_local = _is_local_url(base_url)
+    if is_local:
+        cpu, ram, hp = get_host_summary()
+        hw_header = f"{BOLD}{cpu}{RESET} ({ram} RAM | {hp})"
+        hw_scorecard = f"{cpu} ({ram} RAM, {hp})"
+    else:
+        hw_header = f"{BOLD}Remote Endpoint{RESET} (run './modchip bench' on the server host for CPU/THP info)"
+        hw_scorecard = f"Remote ({base_url} — run './modchip bench' on server host for CPU/THP info)"
+    aff_header = get_server_affinity_summary(base_url)
     raw_model, model_display, _ = detect_active_model(base_url)
     print(f"\n{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.4 — Automated 2-Stage CPU Benchmark Suite                      ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
-    print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | {hp})")
+    print(f"  • Hardware : {hw_header}")
+    if aff_header:
+        print(f"  • Affinity : {aff_header}")
     print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
     print(f"  • Endpoint : {CYAN}{base_url}{RESET}\n")
 
@@ -462,8 +691,8 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"\n{BOLD}{GREEN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.4 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
     print(f"{BOLD}{GREEN}╠════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
-    print(f"  Hardware            : {cpu} ({ram} RAM, {hp})")
-    aff_note = get_server_affinity_summary()
+    print(f"  Hardware            : {hw_scorecard}")
+    aff_note = get_server_affinity_summary(base_url)
     if aff_note:
         print(f"  CPU Affinity        : {aff_note}")
     print(f"  Active Model        : {model_display}")

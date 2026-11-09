@@ -302,8 +302,8 @@ class HardwareInfo:
                 start = ccd_idx * cores_per_ccd
                 selected.extend(self.physical_core_cpus[start : start + keep_per_ccd])
             if len(selected) == t_dec:
-                return format_cpu_list(selected)
-        return format_cpu_list(self.physical_core_cpus)
+                return format_cpu_list(selected) or "0"
+        return format_cpu_list(self.physical_core_cpus) or "0"
 
     @property
     def omp_proc_bind(self) -> str:

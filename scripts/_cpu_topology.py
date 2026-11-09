@@ -38,7 +38,7 @@ def parse_cpu_list(spec: str) -> Set[int]:
 def format_cpu_list(cpus: List[int]) -> str:
     """Format sorted CPU IDs into compact Linux taskset range string (e.g. '0,2,4,6,8-15')."""
     if not cpus:
-        return "0"
+        return ""
     xs = sorted(set(cpus))
     parts: List[str] = []
     start = prev = xs[0]
@@ -79,16 +79,18 @@ def discover_l3_domains() -> Dict[str, int]:
     return domains
 
 
-def enumerate_online_physical_cores() -> List[int]:
-    """Return sorted list of 1 logical CPU ID per online physical core, intersected with sched_getaffinity."""
+def enumerate_online_physical_cores(ignore_affinity: bool = False) -> List[int]:
+    """Return sorted list of 1 logical CPU ID per online physical core (intersected with sched_getaffinity unless ignore_affinity=True)."""
     online_str = _read("/sys/devices/system/cpu/online")
     online_set = parse_cpu_list(online_str) if online_str else set()
-    try:
-        aff = os.sched_getaffinity(0)
-    except (AttributeError, OSError):
-        aff = set()
+    aff: Set[int] = set()
+    if not ignore_affinity:
+        try:
+            aff = os.sched_getaffinity(0)
+        except (AttributeError, OSError):
+            aff = set()
 
-    core_map: Dict[Tuple[int, int], int] = {}
+    core_map: Dict[Tuple[int, int, int], int] = {}
     for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
         m = re.search(r"cpu(\d+)$", cpu_dir)
         if not m:
@@ -99,10 +101,11 @@ def enumerate_online_physical_cores() -> List[int]:
         if aff and cid_num not in aff:
             continue
         pkg_s = _read(os.path.join(cpu_dir, "topology/physical_package_id"))
+        die_s = _read(os.path.join(cpu_dir, "topology/die_id")) or "0"
         core_s = _read(os.path.join(cpu_dir, "topology/core_id"))
         if pkg_s is not None and core_s is not None:
             try:
-                key = (int(pkg_s), int(core_s))
+                key = (int(pkg_s), int(die_s) if die_s.lstrip("-").isdigit() else 0, int(core_s))
                 if key not in core_map or cid_num < core_map[key]:
                     core_map[key] = cid_num
             except ValueError:
@@ -111,6 +114,8 @@ def enumerate_online_physical_cores() -> List[int]:
         return sorted(core_map.values())
     if aff:
         return sorted(aff)
+    if online_set:
+        return sorted(online_set)
     return list(range(os.cpu_count() or 8))
 
 
@@ -131,14 +136,16 @@ def _virtualized() -> bool:
     return bool(re.search(r"\bhypervisor\b", cpuinfo))
 
 
-def drop_l3less_cores(phys_cpus: List[int], log=None) -> Tuple[List[int], List[int]]:
+def drop_l3less_cores(
+    phys_cpus: List[int], log=None, respect_env: bool = True
+) -> Tuple[List[int], List[int]]:
     """
     Exclude off-ring, L3-less cores (e.g. Intel SoC-tile LP-E on Meteor/Arrow Lake-H).
     Returns (kept_cpus, dropped_cpus).
     """
     if (
-        os.environ.get("MODCHIP_KEEP_NO_L3") == "1"
-        or os.environ.get("TASKSET_MASK", "").strip() != ""
+        (respect_env and os.environ.get("MODCHIP_KEEP_NO_L3") == "1")
+        or (respect_env and os.environ.get("TASKSET_MASK", "").strip() != "")
         or _virtualized()
         or len(phys_cpus) < 5
     ):

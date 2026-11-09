@@ -27,17 +27,156 @@ import subprocess
 import sys
 import time
 
-_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
-from _cpu_topology import (  # noqa: E402
-    discover_l3_domains,
-    drop_l3less_cores,
-    enumerate_online_physical_cores,
-    estimate_hybrid_effective_cores,
-    format_cpu_list,
-    parse_cpu_list,
-)
+if "__file__" in globals():
+    _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _SCRIPTS_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPTS_DIR)
+
+try:
+    from _cpu_topology import (  # noqa: E402
+        discover_l3_domains,
+        drop_l3less_cores,
+        enumerate_online_physical_cores,
+        estimate_hybrid_effective_cores,
+        format_cpu_list,
+        parse_cpu_list,
+    )
+except ImportError:
+    # Standalone fallback when piped via `curl -sL .../check_cpu_readiness.py | python3`
+    def _read_sysfs(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def parse_cpu_list(spec):
+        out = set()
+        for part in (spec or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo_s, hi_s = part.split("-", 1)
+                if lo_s.isdigit() and hi_s.isdigit():
+                    out.update(range(int(lo_s), int(hi_s) + 1))
+            elif part.isdigit():
+                out.add(int(part))
+        return out
+
+    def format_cpu_list(cpus):
+        if not cpus:
+            return ""
+        xs = sorted(set(cpus))
+        parts = []
+        start = prev = xs[0]
+        for c in xs[1:]:
+            if c == prev + 1:
+                prev = c
+            else:
+                parts.append(f"{start}-{prev}" if prev - start >= 2 else (f"{start},{prev}" if prev != start else f"{start}"))
+                start = prev = c
+        parts.append(f"{start}-{prev}" if prev - start >= 2 else (f"{start},{prev}" if prev != start else f"{start}"))
+        return ",".join(parts)
+
+    def discover_l3_domains():
+        domains = {}
+        for d in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cache/index[0-9]*")):
+            lvl = _read_sysfs(os.path.join(d, "level"))
+            typ = _read_sysfs(os.path.join(d, "type"))
+            if lvl != "3" or typ not in ("Data", "Unified"):
+                continue
+            s_list = _read_sysfs(os.path.join(d, "shared_cpu_list"))
+            sz_str = (_read_sysfs(os.path.join(d, "size")) or "").upper()
+            if not s_list or not sz_str:
+                continue
+            try:
+                mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}.get(sz_str[-1], 1)
+                domains[s_list] = int(sz_str[:-1] if mult > 1 else sz_str) * mult
+            except ValueError:
+                pass
+        return domains
+
+    def enumerate_online_physical_cores(ignore_affinity=False):
+        online_str = _read_sysfs("/sys/devices/system/cpu/online")
+        online_set = parse_cpu_list(online_str) if online_str else set()
+        aff = set()
+        if not ignore_affinity:
+            try:
+                aff = os.sched_getaffinity(0)
+            except (AttributeError, OSError):
+                aff = set()
+        core_map = {}
+        for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
+            m = re.search(r"cpu(\d+)$", cpu_dir)
+            if not m:
+                continue
+            cid_num = int(m.group(1))
+            if (online_set and cid_num not in online_set) or (aff and cid_num not in aff):
+                continue
+            pkg_s = _read_sysfs(os.path.join(cpu_dir, "topology/physical_package_id"))
+            die_s = _read_sysfs(os.path.join(cpu_dir, "topology/die_id")) or "0"
+            core_s = _read_sysfs(os.path.join(cpu_dir, "topology/core_id"))
+            if pkg_s is not None and core_s is not None:
+                try:
+                    key = (int(pkg_s), int(die_s) if die_s.lstrip("-").isdigit() else 0, int(core_s))
+                    if key not in core_map or cid_num < core_map[key]:
+                        core_map[key] = cid_num
+                except ValueError:
+                    pass
+        if core_map:
+            return sorted(core_map.values())
+        if aff:
+            return sorted(aff)
+        if online_set:
+            return sorted(online_set)
+        return list(range(os.cpu_count() or 8))
+
+    def _cache_levels_fb(cid):
+        levels = set()
+        for d in glob.glob(f"/sys/devices/system/cpu/cpu{cid}/cache/index[0-9]*"):
+            lvl = _read_sysfs(os.path.join(d, "level"))
+            typ = _read_sysfs(os.path.join(d, "type"))
+            if lvl and lvl.isdigit() and typ in ("Data", "Unified"):
+                levels.add(int(lvl))
+        return levels or None
+
+    def drop_l3less_cores(phys_cpus, log=None, respect_env=True):
+        cpuinfo = _read_sysfs("/proc/cpuinfo") or ""
+        if (
+            (respect_env and os.environ.get("MODCHIP_KEEP_NO_L3") == "1")
+            or (respect_env and os.environ.get("TASKSET_MASK", "").strip() != "")
+            or bool(re.search(r"\bhypervisor\b", cpuinfo))
+            or len(phys_cpus) < 5
+        ):
+            return phys_cpus, []
+        info = {c: _cache_levels_fb(c) for c in phys_cpus}
+        if any(v is None for v in info.values()):
+            return phys_cpus, []
+        with_l3 = [c for c in phys_cpus if 3 in info[c]]
+        no_l3 = [c for c in phys_cpus if 3 not in info[c] and 2 in info[c]]
+        if len(with_l3) >= 4 and no_l3 and len(with_l3) + len(no_l3) == len(phys_cpus) and 2 * len(no_l3) <= len(with_l3):
+            if log is not None:
+                log(f"[topology] excluding L3-less cores {no_l3} (SoC-tile LP-E); set MODCHIP_KEEP_NO_L3=1 to keep them")
+            return with_l3, no_l3
+        return phys_cpus, []
+
+    def estimate_hybrid_effective_cores(phys_cpus):
+        n = float(len(phys_cpus) or 1)
+        freqs = []
+        for c in phys_cpus:
+            s = _read_sysfs(f"/sys/devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq")
+            if s and s.isdigit() and int(s) > 0:
+                freqs.append(int(s))
+        if len(freqs) != len(phys_cpus) or not freqs:
+            return n, n, n, False
+        max_f, min_f = float(max(freqs)), float(min(freqs))
+        if min_f >= 0.88 * max_f:
+            return n, n, n, False
+        is_intel = "GenuineIntel" in (_read_sysfs("/proc/cpuinfo") or "")
+        weights = [(f / max_f) * (0.60 if (is_intel and (f / max_f) < 0.88) else 1.0) for f in freqs]
+        dyn_c, stat_c = sum(weights), len(weights) * min(weights)
+        return stat_c, dyn_c, 0.50 * stat_c + 0.50 * dyn_c, True
 
 
 # ============================================================================
@@ -201,7 +340,7 @@ def detect_cpu_and_cache():
 
     phys_ids = info.get("physical_core_ids", list(range(info["physical_cores"])))
     env_mask_override = os.environ.get("TASKSET_MASK", "").strip() if info["os"] == "Linux" else ""
-    info["taskset_mask"] = env_mask_override if env_mask_override else format_cpu_list(phys_ids)
+    info["taskset_mask"] = env_mask_override if env_mask_override else (format_cpu_list(phys_ids) or "0")
 
     return info
 
@@ -454,9 +593,18 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
     prefill_dyn_scale = max(0.15, min((dyn_core_ratio ** 0.85) * prefill_compute_mult * bw_prefill_factor, 6.0))
     prefill_scale = prefill_stat_scale if is_hybrid else prefill_dyn_scale
 
-    # THP penalty check
-    thp_ok = mem["thp_enabled"] in ("always", "madvise", "macos_superpages")
-    thp_mult = 1.0 if thp_ok else 0.82
+    # THP check:
+    # On Linux, 'always' backs anonymous buffers (~17-18.5 GiB) with 2MB THP automatically;
+    # on bare-metal short context the gain is small (~0-3%, larger in VMs / long context).
+    is_linux = cpu.get("os") == "Linux"
+    if not is_linux:
+        thp_optimal = True
+        thp_ok = True
+        thp_mult = 1.00
+    else:
+        thp_optimal = mem["thp_enabled"] == "always"
+        thp_ok = mem["thp_enabled"] in ("always", "madvise")
+        thp_mult = 1.00 if thp_optimal else 0.99
 
     base_floor_tps = 17.2 * decode_scale * thp_mult
     prose_code_tps = 20.2 * decode_scale * thp_mult
@@ -505,6 +653,7 @@ def evaluate_readiness(cpu, mem, measured_bw_gbs):
         "has_amx": has_amx,
         "l3_status": l3_status,
         "thp_ok": thp_ok,
+        "thp_optimal": thp_optimal,
         "measured_bw_gbs": round(eff_bw, 1),
         "can_fit_model_in_ram": can_fit_model_in_ram,
         "max_256k_slots": max_256k_slots,
@@ -566,7 +715,17 @@ def main():
     print(f"  • L3 Cache (LLC)     : {cpu['l3_total_mb']:.1f} MiB ({cpu['l3_instances']} instance(s)) -> {rep['l3_status']}")
     print(f"  • SIMD / Matrix ISA  : {rep['simd_tier']}")
     print(f"  • System RAM         : {mem['total_gb']:.1f} GiB total ({mem['available_gb']:.1f} GiB available, /dev/shm: {mem['shm_total_gb']:.1f} GiB)")
-    print(f"  • 2MB HugePages (THP): enabled=[{mem['thp_enabled']}], defrag=[{mem['thp_defrag']}] {'(OK)' if rep['thp_ok'] else '(WARNING: enable THP for +20% speed!)'}")
+    if cpu.get("os") == "Darwin":
+        print(f"  • 2MB HugePages (THP): macOS superpages (OK)")
+    elif cpu.get("os") != "Linux":
+        print(f"  • 2MB HugePages (THP): n/a ({cpu.get('os', 'non-Linux')})")
+    else:
+        thp_label = (
+            "(OK)"
+            if rep["thp_optimal"]
+            else "(optional: set 'always' to back ~17-18.5 GiB with 2MB pages — mainly helps VMs / long context)"
+        )
+        print(f"  • 2MB HugePages (THP): enabled=[{mem['thp_enabled']}], defrag=[{mem['thp_defrag']}] {thp_label}")
     if bw_gbs > 0:
         print(f"  • Sustained DRAM BW  : {rep['measured_bw_gbs']:.1f} GB/s (multi-core user-space streaming)")
 
@@ -601,9 +760,37 @@ def main():
         print(f"      Avoid spanning a single 3B-active MoE across NUMA interconnects (UPI/Infinity Fabric).")
         print(f"      Instead, pin 1 independent agent instance per NUMA node:")
         print(f"      numactl --cpunodebind=0 --membind=0 llama-server ... -t {cores_per_node} --port 8789")
-    if not rep["thp_ok"] and platform.system() == "Linux":
-        print(f"\n  [!] Tip: Enable Transparent HugePages before launching to avoid 4KB TLB misses:")
-        print(f"      sudo sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled'")
+    if not rep["thp_optimal"] and cpu.get("os") == "Linux":
+        print(f"\n  [!] Tip: Enable 2MB Transparent HugePages before launching (backs ~17-18.5 GiB with 2MB pages):")
+        print(f"      echo always        | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null")
+        print(f"      echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag  >/dev/null")
+        print(f"      (System-wide; resets on reboot — persist via /etc/tmpfiles.d/thp.conf if desired.)")
+    if (
+        cpu.get("os") == "Linux"
+        and cpu.get("arch") == "x86_64"
+        and not cpu.get("hypervisor")
+        and cpu.get("sockets", 1) == 1
+        and bw_gbs > 0.0
+        and rep["measured_bw_gbs"] <= 31.5
+    ):
+        chassis = ""
+        try:
+            with open("/sys/class/dmi/id/chassis_type", "r", encoding="utf-8") as cf:
+                chassis = cf.read().strip()
+        except OSError:
+            pass
+        is_portable = chassis in ("8", "9", "10", "14", "30", "31", "32")
+        print(f"\n  [i] Measured DRAM bandwidth is low ({rep['measured_bw_gbs']:.1f} GB/s).")
+        if is_portable:
+            print(f"      On laptops, check whether only one memory channel is populated:")
+            print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
+            print(f"      Ignore this if dual-channel RAM is already running at its rated speed.")
+        else:
+            print(f"      On desktops this often means RAM at JEDEC default (DDR4-2133/2400) instead of its")
+            print(f"      XMP/DOCP/EXPO rating, or only one channel populated. Check:")
+            print(f"        sudo dmidecode -t memory | grep -iE \"locator|size|speed\"")
+            print(f"      Ignore this if your RAM already runs at its rated speed (common on laptops).")
+            print(f"      (In Issue #17, decode scaled ~+48-50% from 2133 -> 3200 MT/s.)")
     print("=" * 78)
 
 
