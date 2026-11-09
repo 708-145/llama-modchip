@@ -101,6 +101,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -z "$INPUT_GGUF" && "$DEEPSEEK_MODE" -eq 0 ]]; then
+    DEFAULT_Q4="${SCRIPT_DIR}/../workspace/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+    if [[ -f "$DEFAULT_Q4" ]]; then
+        INPUT_GGUF="$DEFAULT_Q4"
+    fi
+fi
+if [[ -z "$OUTPUT_GGUF" && -n "$INPUT_GGUF" && "$DEEPSEEK_MODE" -eq 0 ]]; then
+    if [[ "$PROFILE" == "fractal64" || "$PROFILE" == "ultra14g" ]]; then
+        OUTPUT_GGUF="${SCRIPT_DIR}/../workspace/models/NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64.gguf"
+    else
+        OUTPUT_GGUF="${SCRIPT_DIR}/../workspace/models/NVIDIA-Nemotron-3.5-30B-A3B-MXFP4.gguf"
+    fi
+fi
+
 [[ -z "$INPUT_GGUF" || -z "$OUTPUT_GGUF" ]] && usage
 [[ ! -f "$INPUT_GGUF" ]] && { echo "ERROR: Input GGUF not found: $INPUT_GGUF" >&2; exit 1; }
 
@@ -133,6 +147,9 @@ fi
 
 if [[ -z "$QUANTIZE_BIN" ]]; then
     for cand in \
+        "${SCRIPT_DIR}/../workspace/bin/llama-quantize" \
+        "${SCRIPT_DIR}/../workspace/llama.cpp/build/bin/llama-quantize" \
+        "./workspace/bin/llama-quantize" \
         "./workspace/llama.cpp/build/bin/llama-quantize" \
         "./llama.cpp/build/bin/llama-quantize" \
         "/usr/local/bin/llama-quantize" \
@@ -140,6 +157,20 @@ if [[ -z "$QUANTIZE_BIN" ]]; then
         if [[ -n "$cand" && -x "$cand" ]]; then
             QUANTIZE_BIN="$cand"
             break
+        fi
+    done
+fi
+
+if [[ -z "$QUANTIZE_BIN" || ! -x "$QUANTIZE_BIN" ]]; then
+    for bdir in "${SCRIPT_DIR}/../workspace/llama.cpp/build" "./workspace/llama.cpp/build" "${SCRIPT_DIR}/../llama.cpp/build"; do
+        if [[ -d "$bdir" ]]; then
+            echo "[*] Compiling llama-quantize with native Fractal-64 (GGML_TYPE_Q2_0) kernels..."
+            cmake --build "$bdir" --config Release --target llama-quantize -j "$(nproc)"
+            if [[ -x "${bdir}/bin/llama-quantize" ]]; then
+                QUANTIZE_BIN="${bdir}/bin/llama-quantize"
+                cp -f "$QUANTIZE_BIN" "${SCRIPT_DIR}/../workspace/bin/llama-quantize" 2>/dev/null || true
+                break
+            fi
         fi
     done
 fi

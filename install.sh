@@ -134,7 +134,9 @@ LLAMA_BUILD_DIR="${WORKSPACE_DIR}/llama.cpp"
 bash "${REPO_ROOT}/scripts/build_zen5_llama.sh" "$LLAMA_BUILD_DIR"
 
 cp -f "${LLAMA_BUILD_DIR}/build/bin/llama-server" "${WORKSPACE_DIR}/bin/llama-server-nemotron"
+cp -f "${LLAMA_BUILD_DIR}/build/bin/llama-quantize" "${WORKSPACE_DIR}/bin/llama-quantize" 2>/dev/null || true
 echo "[+] Installed binary: ${WORKSPACE_DIR}/bin/llama-server-nemotron"
+echo "[+] Installed binary: ${WORKSPACE_DIR}/bin/llama-quantize"
 
 echo "[*] Compiling RouteCrack vocabulary tokenizer & table builder..."
 g++ -O3 -std=c++17 "${REPO_ROOT}/speculative/cpp/rc_tokenize_nemotron.cpp" \

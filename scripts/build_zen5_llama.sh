@@ -70,7 +70,7 @@ cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" \
     -DCMAKE_BUILD_TYPE=Release \
     "${CMAKE_ISA_ARGS[@]}"
 
-echo "[*] Building llama-server with $(nproc) threads..."
-cmake --build "$LLAMA_DIR/build" --config Release -j "$(nproc)" --target llama-server
+echo "[*] Building llama-server & llama-quantize with $(nproc) threads..."
+cmake --build "$LLAMA_DIR/build" --config Release -j "$(nproc)" --target llama-server llama-quantize
 
-echo "[+] Build complete: $LLAMA_DIR/build/bin/llama-server"
+echo "[+] Build complete: $LLAMA_DIR/build/bin/llama-server & llama-quantize"

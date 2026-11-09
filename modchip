@@ -30,7 +30,15 @@ if [[ -z "${GATEWAY_HOST:-}" ]] && [[ -f "$GATEWAY_HOST_FILE" ]]; then
     GATEWAY_HOST="$(head -n 1 "$GATEWAY_HOST_FILE" 2>/dev/null | tr -d '[:space:]')"
 fi
 GATEWAY_HOST="${GATEWAY_HOST:-127.0.0.1}"
-DEFAULT_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+FRACTAL_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64.gguf"
+Q4_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+if [[ -f "$FRACTAL_MODEL" ]]; then
+    DEFAULT_MODEL="$FRACTAL_MODEL"
+elif [[ -f "$Q4_MODEL" ]]; then
+    DEFAULT_MODEL="$Q4_MODEL"
+else
+    DEFAULT_MODEL="$Q4_MODEL"
+fi
 
 BOLD="\033[1m"
 GREEN="\033[92m"
