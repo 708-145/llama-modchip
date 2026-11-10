@@ -40,6 +40,9 @@ fi
 APPLE_SILICON_PATCHES="${APPLE_SILICON_PATCHES:-auto}"
 if [[ "$APPLE_SILICON_PATCHES" == "auto" ]]; then
     if [[ "$OS_NAME" == "Darwin" ]]; then APPLE_SILICON_PATCHES=1; else APPLE_SILICON_PATCHES=0; fi
+elif [[ "$APPLE_SILICON_PATCHES" != "0" && "$APPLE_SILICON_PATCHES" != "1" ]]; then
+    echo "[!] ERROR: Invalid APPLE_SILICON_PATCHES='$APPLE_SILICON_PATCHES'. Use 'auto', '0', or '1'." >&2
+    exit 1
 fi
 SERIES_PATCHES=()
 if [[ "$APPLE_SILICON_PATCHES" == "1" ]]; then
@@ -66,7 +69,10 @@ if [[ ${#SERIES_PATCHES[@]} -gt 0 ]]; then
         # edits, so it only resets the tree when asked to.
         if [[ "${RESET_LLAMA_TREE:-0}" == "1" ]]; then
             echo "[*] Only $N_SERIES_IN_TREE of ${#SERIES_PATCHES[@]} patches from patches/nemotron-apple-silicon/ are in $LLAMA_DIR; RESET_LLAMA_TREE=1: resetting its working tree to clean $LLAMA_COMMIT (uncommitted changes are discarded)..."
-            git -C "$LLAMA_DIR" checkout -- .
+            git -C "$LLAMA_DIR" checkout HEAD -- .
+            while read -r created_file; do
+                [[ -n "$created_file" ]] && rm -f "$LLAMA_DIR/$created_file"
+            done < <(git -C "$REPO_ROOT" apply --summary "$PATCH_FILE" 2>/dev/null | awk '/create mode/{print $4}')
         else
             echo "[!] ERROR: Only $N_SERIES_IN_TREE of ${#SERIES_PATCHES[@]} patches from patches/nemotron-apple-silicon/ are in $LLAMA_DIR (an interrupted run?)." >&2
             echo "[!] Nothing was changed. To discard the uncommitted changes in $LLAMA_DIR and apply everything again, run:" >&2
@@ -86,7 +92,10 @@ elif git -C "$LLAMA_DIR" apply --check "$PATCH_FILE" 2>/dev/null; then
     echo "[+] Kernel & KV patches applied cleanly."
 else
     echo "[*] Resetting $LLAMA_DIR working tree to clean $LLAMA_COMMIT before applying updated patch..."
-    git -C "$LLAMA_DIR" checkout -- .
+    git -C "$LLAMA_DIR" checkout HEAD -- .
+    while read -r created_file; do
+        [[ -n "$created_file" ]] && rm -f "$LLAMA_DIR/$created_file"
+    done < <(git -C "$REPO_ROOT" apply --summary "$PATCH_FILE" 2>/dev/null | awk '/create mode/{print $4}')
     if git -C "$LLAMA_DIR" apply --check "$PATCH_FILE"; then
         git -C "$LLAMA_DIR" apply "$PATCH_FILE"
         echo "[+] Updated kernel & KV patches applied cleanly."

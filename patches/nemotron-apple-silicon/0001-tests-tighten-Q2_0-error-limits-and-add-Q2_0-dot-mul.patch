@@ -196,7 +196,7 @@ index 9510ac1..8963367 100644
                  ? MAX_DOT_PRODUCT_ERROR_TERNARY
                  : type == GGML_TYPE_NVFP4
                  ? MAX_DOT_PRODUCT_ERROR_FP4
-@@ -200,6 +207,65 @@ static int test_vec_dot_q(bool verbose) {
+@@ -200,6 +207,67 @@ static int test_vec_dot_q(bool verbose) {
      return num_failed;
  }
  
@@ -245,7 +245,9 @@ index 9510ac1..8963367 100644
 +            float result = INFINITY;
 +            q2_0_cpu->vec_dot(n, &result, 0, q2.data(), 0, q8.data(), 0, 1);
 +            const double err = fabs(result - ref) / abs_ref;
-+            if (!(err <= worst)) {
++            if (std::isnan(err) || std::isnan(worst)) {
++                worst = NAN;
++            } else if (err > worst) {
 +                worst = err;
 +            }
 +        }
