@@ -315,4 +315,43 @@ RouteCrack + Stockfish-PVS is a **token-level speculative decoding** technique t
 
 ---
 
+## Why Is It Called "modchip"?
+
+The name **`llama-modchip`** (also called **"Priiloader / Modchip"**) comes from its design as a **runtime microarchitecture patcher** for CPU LLM inference — inspired by **console modchips** and **Priiloader** (`hacks.ini`).
+
+### What "Modchip" Means Here
+
+A **console modchip** is a small firmware file that patches/overrides a game's hardware drivers so they run correctly on a specific platform — essentially a microcode-level patch for the host OS/hardware.
+
+**`llama-modchip` does the same thing for GGUF models:**
+
+| Console Modchip | llama-modchip |
+|---|---|
+| Inspects console hardware | Inspects `.gguf` model header + Linux CPU/cache topology (<5 ms) |
+| Patches game drivers at runtime | Patches `ggml-cpu`/`ggml-quants` kernel parameters at runtime |
+| Classifies hacks by safety | Classifies microarchitectural hacks into safety tiers: 🟢 SAFE / 🔵 AUTO-ADAPTIVE / 🟡 EXPERIMENTAL / ⚪ LOCKED |
+| Lives in firmware | Lives in `/dev/shm/llama_modchip.bin` (48-byte POSIX shared-memory struct) |
+| Applied once at boot | Applied per-forward-pass (live override) |
+
+### Dual Operation Levels
+
+1. **Startup & Graph-Construction Profile** — Injects load-time parameters:
+   - `LLAMA_MOE_TOP_K`, `--repack`, `MADV_HUGEPAGE`
+   - Deterministic per-CCD `taskset -c` core pinning
+   - Quantization cache types (`-ctk q8_0 -ctv q4_0`)
+
+2. **Live Per-Forward-Pass Control** — Writes to `/dev/shm/llama_modchip.bin` read on **every forward/draft pass** by:
+   - `ggml-cpu/ops.cpp` → attention window, sinks, SWA stride, L3 window
+   - `common/ngram-map.cpp` → RouteCrack enabled, cert thresholds (`rc_cert_d0/d1/d2`)
+
+### The "Priiloader" Alias
+
+The interactive TUI (`scripts/llama_modchip.py --tui`) is called **"Priiloader"** — a custom curses interface (from `hacks.ini`) that lets you **toggle microarchitectural hacks live at runtime**, just like Priiloader on the Wii lets you toggle system patches.
+
+### Command Surface
+
+When you run `./modchip chat`, `./modchip quantize`, `./modchip bench`, or `./modchip eval`, you're invoking the **Modchip** — the microarchitecture-adaptive patching layer that makes any GGUF model run optimally on your specific CPU.
+
+---
+
 *Project: `synchopate/llama-modchip` · Version 2.4.0 · License: Apache 2.0*
