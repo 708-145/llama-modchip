@@ -1,5 +1,11 @@
 # llama-modchip Summary (v2.4.0)
 
+## Ideas
+
+- use ExpertSelectReducedMantissa global scale: save 1B
+- use 3bit LUT for 4 bit block scale: save 1B
+- overal 28B == 3.5bpw
+
 ## What is llama-modchip?
 
 `llama-modchip` is a set of `ggml`/`llama.cpp` kernel patches, quantization utilities, and a unified CLI for running large language models (primarily **Nemotron-3.5-30B-A3B** and **DeepSeek-V4-Flash 284B**) on CPUs **without GPUs**. It targets **CPU-first inference** for 284B and 30B Mixture-of-Experts models on 16–64 GB RAM, breaking the traditional "enterprise GPU required" bottleneck.
@@ -148,4 +154,87 @@ Used for **DeepSeek-V4-Flash 284B** (routed experts -> Fractal-64) and **Nemotro
 - Benchmarks: `benchmarks/eval_quality_and_tools.py`, `FRACTAL_MOE_QUALITY_GATE.md`
 
 ---
+
+## Deep Dive: CSA/LID Skip Mechanism
+
+### What is CSA/LID?
+**CSA/LID** = **Compressed Sparse Attention / Latent Indexer Decoder**. A core component in the **DeepSeek-V4-Flash 284B** architecture implementing **sparse indexing** for Mixture-of-Experts (MoE) layers. Part of the **Sinkhorn-20 Hyper-Connections** system.
+
+- **CSA (Compressed Sparse Attention)**: Handles the attention computation efficiently
+- **LID (Latent Indexer Decoder)**: Manages expert routing/indexing
+- **HCA (Hyper-Connection Architecture)**: Connects everything via 4-stream Sinkhorn-20 mixing
+
+### The CSA/LID Skip Optimization
+
+#### Problem It Solves
+During **autoregressive decoding** (generating tokens one-by-one), the DeepSeek-V4 model previously rebuilt the **entire 4,551-node compute graph** on every single token. This includes the CSA/LID compressor nodes that perform sparse attention indexing — expensive work that's only needed when *new* context is being compressed, not during regular decode steps.
+
+#### How It Works
+
+**1. Dummy Compressor Nodes Tagged with Skip Flag**
+The compute graph contains dummy CSA/LID compressor nodes that are **always present** in the graph structure. These nodes are tagged at graph-build time with:
+```cpp
+flags |= 0x100  // GGML_TENSOR_FLAG_DSV4_SKIP
+```
+
+**2. Runtime Skip Decision**
+During decoding, a global flag is evaluated:
+```cpp
+extern int ggml_dsv4_skip_csa_comp;
+
+ggml_dsv4_skip_csa_comp = (plan.state_write_pos.size() == 1 && plan.state_write_pos[0] == -1) ? 1 : 0;
+```
+
+**Condition for skipping**: `plan.state_write_pos.size() == 1 && plan.state_write_pos[0] == -1`
+- Means: "We're reading from a single snapshot position that's -1 (no new state to write)"
+- This occurs on **7 out of every 8 decode steps** (non-compressor steps)
+- The **1st step** (compressor step) writes new state → skip = 0
+- The **next 7 steps** just read existing state → skip = 1
+
+**3. Execution Flow**
+```cpp
+// In graph execution:
+if (skip_csa_comp) {
+    // Skip NOPs or dynamically skipped dummy CSA/LID compression node
+    // Just reuse existing recurrent state without recomputing
+} else {
+    // Full CSA/LID computation needed (compressor step)
+}
+```
+
+#### What Gets Eliminated
+
+| Without Skip | With Skip |
+|---|---|
+| 4,551-node graph rebuild every token | Graph rebuild **only on compressor steps** (1/8 tokens) |
+| CSA/LID attention computed every step | CSA/LID attention **skipped 7/8 steps** |
+| Full recurrent state recomputation | **State reuse** from previous compressor step |
+
+#### Performance Impact (from ARCHITECTURE.md / RELEASE_NOTES.md)
+
+| Metric | Before Skip | After Skip | Improvement |
+|---|---|---|---|
+| Single-token decode latency | 169.3 ms/tok | 100.5–110.3 ms/tok | **1.5–1.7× faster** |
+| Decode throughput | 5.91 tok/s | 9.06–10.74 tok/s | **+53% to +68%** |
+| Prefill throughput | 24.70–25.05 tok/s | 43.16–44.36 tok/s | **+77%** |
+| Draft acceptance (speculative) | — | 94.5% | Enables high-quality speculative decoding |
+
+#### Interaction with Other Optimizations
+The CSA/LID Skip works synergistically with:
+- **8-slot Q8_K/Q8_0 activation cache** (`s_q8_cache_buf`) — caches quantized inputs
+- **MUL_MAT_ID row-group reuse** (`g_tls_mmid_ids_valid`) — shares work across `up_exps` and `gate_exps`
+- **Token-to-core L1D/L2 affinity** — pins `it` to thread `ith = it % nth` across `DSV4_HC_POST → DSV4_HC_PRE → RMS_NORM`
+- **Non-temporal prefetch** (`_MM_HINT_NTA`) — protects L3 cache for hot KV/SSM state
+
+#### Weights and Data Used
+- **Weights**: The CSA/LID mechanism itself doesn't "select" weights. It operates on **recurrent state tensors** (the compressed attention/hyper-connection state), not on MoE expert weights.
+- **Inputs**: Previous step's recurrent state (`kv_csa`, `kv_lid`, `kv_hca`)
+- **Outputs**: Updated recurrent state (only on compressor steps)
+- **Router logits**: The MoE router still runs normally; CSA/LID Skip only affects the *hyper-connection* state update path
+
+#### Key Insight
+This is **not** a weight-selection or pruning technique. It's a **graph-execution optimization** that recognizes the recurrent state only needs updating on **compressor steps** (1/8 tokens) and can be **carried forward unchanged** on the other 7/8 steps. The "skip" eliminates an entire subgraph of attention computations, not individual weights.
+
+---
+
 *Project: `synchopate/llama-modchip` · Version 2.4.0 · License: Apache 2.0*
