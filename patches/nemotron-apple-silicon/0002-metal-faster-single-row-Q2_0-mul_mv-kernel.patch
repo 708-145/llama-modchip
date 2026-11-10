@@ -39,12 +39,67 @@ per threadgroup, and 14 cases with random raw blocks). Changing
 hb = t >> 1 to hb = t & 1 in the new kernel leaves 84 of the 202
 passing (exit 1).
 
+Second step, same two kernels: a threadgroup pair-lookup table. The
+per-weight codebook work above (select between two packed constants,
+signed bit-field extract, int-to-float conversion) still dominated, so
+the thread layout is kept and that work is replaced by a small table:
+
+- A 64-entry float2 table in threadgroup memory (512 bytes), filled at
+  kernel start. Entry i holds (cb[i & 7], cb[i >> 3]), the codebook
+  values of two neighbouring weights. Every simdgroup writes the whole
+  table, then one unconditional threadgroup_barrier, the same pattern
+  the IQ4_NL kernel uses.
+- The byte-packed 3-bit indices of 4 weights are merged pairwise with
+  (ix | (ix >> 5)) & 0x003F003F, so 4 weights cost two table reads.
+- The H >> hb and scale shifts are hoisted out of the group loop; the
+  four 4 + nibble sub-block scales become one float4 applied with dot().
+- qs / qh / scales are loaded as packed_ushort2 (alignment 2, legal on
+  the 2-byte-aligned 30-byte block).
+- The plain mul_mv entry point gains the threadgroup memory argument,
+  and smem is set for Q2_0 in ggml_metal_library_get_pipeline_mul_mv
+  and ..._mul_mv_id.
+
+Measured on an M1 Max, test-backend-ops perf -b MTL0 (us per run,
+first step -> with the table):
+  MUL_MAT_ID 6 of 128 experts, 2688 -> 1856, n = 1   199.3 -> 91.5
+  MUL_MAT_ID 6 of 128 experts, 1856 -> 2688, n = 1   191.9 -> 91.9
+  MUL_MAT 2688 -> 3712, n = 1                         73.1 -> 34.9
+In the same runs IQ4_NL takes 85.7 / 86.3 us and Q4_0 60.8 / 63.0 us on
+the two expert ops. Alternatives measured: table-free SWAR 131 / 127 us,
+plain 8-entry float table 99 us, 16 KB tables 50 us or more slower.
+With the table: test-backend-ops -b MTL0 MUL_MAT 1177/1177 and
+MUL_MAT_ID 802/802; test-quantize-fns passes. Decoded weights are
+exactly those of dequantize_row_q2_0; float additions are in a
+different order than in the first step, so results differ in the last
+bits.
+
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
- ggml/src/ggml-metal/ggml-metal-impl.h |  2 +-
- ggml/src/ggml-metal/ggml-metal.metal  | 71 ++++++++++++++++-----------
- 2 files changed, 42 insertions(+), 31 deletions(-)
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  2 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     |  2 +-
+ ggml/src/ggml-metal/ggml-metal.metal      | 83 +++++++++++++++++++------------
+ 3 files changed, 55 insertions(+), 32 deletions(-)
 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index c153bd8..6d152f3 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -844,6 +844,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+             {
+                 nsg = N_SG_Q2_0;
+                 nr0 = N_R0_Q2_0;
++                smem = 64*2*sizeof(float);
+             } break;
+         case GGML_TYPE_Q4_0:
+             {
+@@ -1073,6 +1074,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             {
+                 nsg = N_SG_Q2_0;
+                 nr0 = N_R0_Q2_0;
++                smem = 64*2*sizeof(float);
+             } break;
+         case GGML_TYPE_Q4_0:
+             {
 diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
 index e173b91..cf15518 100644
 --- a/ggml/src/ggml-metal/ggml-metal-impl.h
@@ -59,10 +114,10 @@ index e173b91..cf15518 100644
  
  #define N_R0_Q4_0 4
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index f72804e..e2392b3 100644
+index f72804e..09683c6 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -3469,31 +3469,45 @@ inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thre
+@@ -3469,31 +3469,48 @@ inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thre
      return qb_curr->d * (2.0f * acc - sumy);
  }
  
@@ -76,9 +131,10 @@ index f72804e..e2392b3 100644
 -    const float m_lo     = (float)(4u + ((uint(qb_curr->scales[s_idx + 0]) >> s_shift) & 0x0Fu));
 -    const float m_hi     = (float)(4u + ((uint(qb_curr->scales[s_idx + 1]) >> s_shift) & 0x0Fu));
 +// Q2_0 decode-path dot: 4 threads cooperate on one 64-weight block (thread t handles k = 4t..4t+3 of every group g,
-+// i.e. weights 16*g + 4*t + c, so each byte of qs/qh/scales is loaded by exactly one thread, as 16-bit words).
-+// The codebook {-14,-8,-4,-1,1,4,8,14} is looked up from two packed 32-bit constants with a signed bit-field extract
-+// (no memory LUT, no dynamic indexing of constant arrays).
++// i.e. weights 16*g + 4*t + c, loaded as 16-bit words). Each qs byte is loaded by exactly one thread; each qh byte is
++// read by two threads (t and t+2, which use different bits of it); every thread loads the 4 scale bytes and uses two.
++// The codebook {-14,-8,-4,-1,1,4,8,14} is only evaluated (from two packed 32-bit constants, signed bit-field extract)
++// to fill a threadgroup pair table at kernel start; the dot then looks up two weights per threadgroup-memory read.
 +inline float q2_0_cb(uint idx) {
 +    const uint w = (idx & 4) ? 0x0E080401u : 0xFFFCF8F2u;
 +    return (float) extract_bits((int) w, (idx & 3) * 8, 8);
@@ -86,49 +142,51 @@ index f72804e..e2392b3 100644
  
 -    float acc_lo = 0.0f;
 -    float acc_hi = 0.0f;
-+inline float q2_0_dot_thread(device const block_q2_0 * qb, thread const float4 * y4, short t) {
-+    device const ushort * qs16 = (device const ushort *) qb->qs     + 2*t;
-+    device const ushort * qh16 = (device const ushort *) qb->qh     + ((2*t) & 3);
-+    device const ushort * sc16 = (device const ushort *) qb->scales;
++inline float q2_0_dot_thread(device const block_q2_0 * qb, thread const float4 * y4, threadgroup const float2 * lut2, short t) {
++    // 32-bit words are assembled from 2-byte-aligned packed_ushort2 loads (blocks are only 2-byte aligned)
++    const packed_ushort2 qv = *(device const packed_ushort2 *)(qb->qs + 4*t);
++    const packed_ushort2 hv = *(device const packed_ushort2 *)(qb->qh + ((4*t) & 7));
++    const packed_ushort2 sv = *(device const packed_ushort2 *)(qb->scales);
  
 -    FOR_UNROLL (int k = 0; k < 8; ++k) {
 -        const uint qh_b  = qb_curr->qh[k];
 -        const uint lo2_0 = (uint(qb_curr->qs[k]) >> shift_lo) & 0x03u;
 -        const uint hi1_0 = (qh_b >> shift_lo) & 0x01u;
 -        acc_lo += yl[k] * fractal3_val(lo2_0, hi1_0);
-+    const uint Q = (uint) qs16[0] | ((uint) qs16[1] << 16);
-+    const uint H = (uint) qh16[0] | ((uint) qh16[1] << 16);
-+    const uint S = (uint) sc16[0] | ((uint) sc16[1] << 16);
++    const uint Q = (uint) qv[0] | ((uint) qv[1] << 16);
++    const uint H = (uint) hv[0] | ((uint) hv[1] << 16);
++    const uint S = (uint) sv[0] | ((uint) sv[1] << 16);
  
 -        const uint lo2_1 = (uint(qb_curr->qs[k + 8]) >> shift_lo) & 0x03u;
 -        const uint hi1_1 = (qh_b >> (shift_lo + 1)) & 0x01u;
 -        acc_hi += yl[k + 8] * fractal3_val(lo2_1, hi1_1);
 +    const short hb = t >> 1; // k >> 3 for this thread's k range
++    const uint  Hs = H >> hb;
++    const uint  T  = S >> (8*hb);
 +
-+    float acc = 0.0f;
++    // 4 + scale nibble of sub-block 2g+hb (g = 0..3): low nibbles of bytes hb, 2+hb, then their high nibbles
++    const float4 sc = float4(T & 0xF, (T >> 16) & 0xF, (T >> 4) & 0xF, (T >> 20) & 0xF) + 4.0f;
++
++    float4 sg;
 +
 +    FOR_UNROLL (short g = 0; g < 4; g++) {
-+        const uint ix = ((Q >> (2*g)) & 0x03030303u) | (((H >> (2*g + hb)) & 0x01010101u) << 2);
++        // per byte (= weight k): 2 low bits | high bit << 2, i.e. the 3-bit codebook index
++        const uint ix = ((Q >> (2*g)) & 0x03030303u) | (((Hs >> (2*g)) << 2) & 0x04040404u);
++        // merge the indices of weights (0,1) and (2,3) into two 6-bit indices into the pair table
++        const uint pi = (ix | (ix >> 5)) & 0x003F003Fu;
 +
-+        const float4 yv = y4[g];
-+        const float sg = q2_0_cb( ix        & 7) * yv[0] +
-+                         q2_0_cb((ix >>  8) & 7) * yv[1] +
-+                         q2_0_cb((ix >> 16) & 7) * yv[2] +
-+                         q2_0_cb((ix >> 24)    ) * yv[3];
++        const float2 p01 = lut2[pi & 0xFFFF];
++        const float2 p23 = lut2[pi >> 16];
 +
-+        // sub-block b = 2g + hb: b < 4 -> low nibble of scales[b], else high nibble of scales[b-4]
-+        const short b   = 2*g + hb;
-+        const uint  nib = (g < 2) ? ((S >> (8*b)) & 0x0F) : ((S >> (8*(b - 4) + 4)) & 0x0F);
-+
-+        acc += (float)(4 + nib) * sg;
++        sg[g] = y4[g][0]*p01[0] + y4[g][1]*p01[1] + y4[g][2]*p23[0] + y4[g][3]*p23[1];
      }
  
 -    return (float)qb_curr->d * (acc_lo * m_lo + acc_hi * m_hi);
-+    return (float) qb->d * acc;
++    return (float) qb->d * dot(sc, sg);
  }
  
  // function for calculate inner product between half a q4_0 block and 16 floats (yl), sumy is SUM(yl[i])
-@@ -3832,25 +3846,22 @@ void kernel_mul_mv_q2_0_f32_impl(
+@@ -3832,25 +3849,28 @@ void kernel_mul_mv_q2_0_f32_impl(
          ax[row] = (device const block_q2_0 *) ((device char *) src0 + offset0);
      }
  
@@ -137,6 +195,12 @@ index f72804e..e2392b3 100644
      float sumf[nr0] = {0.f};
  
 -    // group 64: 4 sub-blocks of 16 weights per Q2_0 block
++    // pair table: entry i = (cb[i & 7], cb[i >> 3]) for the codebook values of two weights at once
++    threadgroup float2 * lut2 = (threadgroup float2 *) shmem;
++    lut2[tiisg]      = float2(q2_0_cb(tiisg & 7),        q2_0_cb(tiisg >> 3));
++    lut2[tiisg + 32] = float2(q2_0_cb((tiisg + 32) & 7), q2_0_cb((tiisg + 32) >> 3));
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
 +    // 4 threads per 64-weight block, 8 blocks in flight per simdgroup
      const short ix = (tiisg/4);
 -    const short il = (tiisg%4)*16;
@@ -157,7 +221,20 @@ index f72804e..e2392b3 100644
  
          FOR_UNROLL (short row = 0; row < nr0; row++) {
 -            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
-+            sumf[row] += q2_0_dot_thread(ax[row] + ib, y4, it);
++            sumf[row] += q2_0_dot_thread(ax[row] + ib, y4, lut2, it);
          }
  
          yb += QK2_0 * (N_SIMDWIDTH/4);
+@@ -3873,10 +3893,11 @@ kernel void kernel_mul_mv_q2_0_f32(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
+         uint3  tgpig[[threadgroup_position_in_grid]],
+         ushort tiisg[[thread_index_in_simdgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+-    kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
++    kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
+ kernel void kernel_mul_mv_q4_0_f32(

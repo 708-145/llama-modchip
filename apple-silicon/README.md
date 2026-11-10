@@ -22,7 +22,8 @@ BUILD_TESTS=1 ./apple-silicon/setup.sh      # BUILD_TESTS=1 also builds test-qua
 ```
 
 `scripts/build_zen5_llama.sh` applies `patches/zen5-nemotron-256k-optimizations.patch` and, on macOS, the patches in
-`patches/nemotron-apple-silicon/`: a faster single-row (decode) `Q2_0` Metal kernel, the `Q2_0` block size in
+`patches/nemotron-apple-silicon/`: a faster single-row (decode) `Q2_0` Metal kernel (a 4-thread block layout
+plus a 512-byte threadgroup pair-lookup table for the codebook), the `Q2_0` block size in
 `gguf-py`, and tighter `Q2_0` tests (including a random-block dot product test that also covers the armv8.0 NEON
 branch when built with `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a`, and `test-backend-ops` cases with random
 raw `Q2_0` blocks). On other systems these patches are not applied, so a Linux build is unchanged; set
