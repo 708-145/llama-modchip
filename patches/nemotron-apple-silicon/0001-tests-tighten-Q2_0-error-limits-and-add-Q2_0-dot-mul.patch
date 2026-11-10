@@ -1,0 +1,272 @@
+Subject: [PATCH 1/3] tests: tighten Q2_0 error limits and add Q2_0 dot/mul_mat
+ cases
+
+test-quantize-fns checks Q2_0 against the ternary limits (0.01 for
+quantization error, 0.15 for dot product error), which are far above
+what the 30-byte Q2_0 format reaches (0.0025 and 0.0148). Give Q2_0
+its own limits, 0.005 and 0.03.
+
+Those limits still use quantizer output, whose sub-block scales cover a
+narrow range. Swapping two sub-block multipliers in the NEON kernel
+gives a dot product error of 0.0137 (0.0148 unmodified), so it passes.
+Add a test that runs the CPU Q2_0 x Q8_0 vec_dot on random block bytes
+(random scales and indices; rows of 64, 1856 and 2688 weights) and
+compares it with a double precision reference from the dequantized
+values. The error normalised by sum|w*x| is about 5e-8 and the limit is
+1e-5. The mutation above gives 0.03-0.3 and fails. The
+test runs whichever kernel the build selects, so on a build without
+dotprod (-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a) it covers the
+armv8.0 branch.
+
+test-backend-ops had only the default mul_mat shapes for Q2_0. Add
+eval cases at the dimensions the 3B-active Nemotron model uses
+(k = 64, 1856, 2688; m = 257, which is not a multiple of the rows a
+Metal kernel handles per threadgroup; n = 1..128 so the mul_mv,
+mul_mv_ext and mul_mm paths and the CPU 1x{8,4,3,2} tiling are all
+hit) plus mul_mat_id with n = 1 and n = 64.
+
+The quantizer produces sub-block scale nibbles in a narrow range (mostly
+the high end), so those cases cannot show that the Metal kernel decodes
+every multiplier correctly. Add mul_mat and mul_mat_id variants
+(k = 64 and 1856, n = 1..32) that fill the Q2_0 weights with random raw
+block bytes and a finite fp16 scale (14 more cases; 202 in total for
+-p q2_0). Using max(nib, 4u) as the Metal sub-block nibble, i.e. treating scale
+nibbles 0..3 as 4, passes all 188 quantizer-based cases and fails
+8 of the new ones. In the perf list add
+decode and small-batch shapes (n = 1, 2, 3, 4, 5, 8, 512) for Q2_0 and
+Q4_0.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ tests/test-backend-ops.cpp  | 85 +++++++++++++++++++++++++++++++++++++
+ tests/test-quantize-fns.cpp | 71 ++++++++++++++++++++++++++++++-
+ 2 files changed, 154 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a4c2215..15838df 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4494,6 +4494,62 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++// Q2_0 tensors normally get blocks from the quantizer, whose sub-block scale nibbles cover only a narrow range (the
++// largest few values). These variants fill the Q2_0 weights with random raw block bytes (all 16 scale nibbles, all 3-bit
++// indices) and a finite fp16 scale so that every sub-block multiplier and index decode path is checked against the CPU.
++static void init_q2_0_random_blocks(ggml_tensor * t) {
++    GGML_ASSERT(t->type == GGML_TYPE_Q2_0 && ggml_is_contiguous(t));
++    const size_t bs = ggml_type_size(GGML_TYPE_Q2_0);
++    std::vector<uint8_t> data(ggml_nbytes(t));
++    std::default_random_engine gen(1234);
++    std::uniform_int_distribution<int> byte(0, 255);
++    std::uniform_real_distribution<float> scale(0.002f, 0.2f);
++    for (size_t off = 0; off < data.size(); off += bs) {
++        for (size_t i = 0; i < bs; i++) {
++            data[off + i] = (uint8_t) byte(gen);
++        }
++        const ggml_fp16_t d = ggml_fp32_to_fp16(scale(gen));
++        memcpy(&data[off], &d, sizeof(d)); // the first 2 bytes of a block are the fp16 scale
++    }
++    ggml_backend_tensor_set(t, data.data(), 0, data.size());
++}
++
++struct test_mul_mat_q2_0_random_blocks : public test_mul_mat {
++    test_mul_mat_q2_0_random_blocks(int64_t m, int64_t n, int64_t k)
++        : test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
++
++    std::string vars() override {
++        return test_mul_mat::vars() + ",random_blocks=1";
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        test_mul_mat::initialize_tensors(ctx);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_Q2_0) {
++                init_q2_0_random_blocks(t);
++            }
++        }
++    }
++};
++
++struct test_mul_mat_id_q2_0_random_blocks : public test_mul_mat_id {
++    test_mul_mat_id_q2_0_random_blocks(int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
++        : test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, n_mats, n_used, false, m, n, k) {}
++
++    std::string vars() override {
++        return test_mul_mat_id::vars() + ",random_blocks=1";
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        test_mul_mat_id::initialize_tensors(ctx);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_Q2_0) {
++                init_q2_0_random_blocks(t);
++            }
++        }
++    }
++};
++
+ // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+ struct test_mul_mat_id_fusion : public test_case {
+     const ggml_type type_a;
+@@ -8888,6 +8944,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ #endif
+ 
++    // Q2_0 (Fractal-64, 30-byte block) at model-realistic dims: odd block counts, multi-row, all mul_mv/mul_mv_ext/mul_mm batch regimes
++    for (int k : {64, 1856, 2688}) {
++        for (int n : {1, 2, 3, 5, 8, 9, 32, 128}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 257, n, k, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, false, 130, 1,  k));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, false, 130, 64, k));
++    }
++
++    // same shapes with random raw Q2_0 block bytes instead of quantizer output
++    for (int k : {64, 1856}) {
++        for (int n : {1, 2, 5, 9, 32}) {
++            test_cases.emplace_back(new test_mul_mat_q2_0_random_blocks(257, n, k));
++        }
++        test_cases.emplace_back(new test_mul_mat_id_q2_0_random_blocks(8, 2, 130, 1,  k));
++        test_cases.emplace_back(new test_mul_mat_id_q2_0_random_blocks(8, 2, 130, 64, k));
++    }
++
+ #if 1
+     for (ggml_type type_a : base_types) {
+         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+@@ -10121,6 +10195,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // decode-shaped expert and dense matmuls at Nemotron-3.5-30B-A3B dims (hidden 2688, expert ffn 1856, 128 experts, 6 used),
++    // n = 1 (decode), 2..8 (small batches, speculative decoding) and 512 (prefill)
++    for (ggml_type type_a : {GGML_TYPE_Q2_0, GGML_TYPE_Q4_0}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 6, false, 1856, 1, 2688));
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 6, false, 2688, 1, 1856));
++        for (int n : {1, 2, 3, 4, 5, 8, 512}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2688, n, 2688, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 1, 2688, {1, 1}, {1, 1}));
++    }
++
+     return test_cases;
+ }
+ 
+diff --git a/tests/test-quantize-fns.cpp b/tests/test-quantize-fns.cpp
+index 9510ac1..8963367 100644
+--- a/tests/test-quantize-fns.cpp
++++ b/tests/test-quantize-fns.cpp
+@@ -6,7 +6,9 @@
+ #undef NDEBUG
+ #include <assert.h>
+ #include <math.h>
++#include <random>
+ #include <stdio.h>
++#include <string.h>
+ #include <string>
+ #include <vector>
+ 
+@@ -27,6 +29,9 @@ constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
+ constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
+ constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
+ constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
++// Q2_0 (Fractal-64, 3-bit codebook + 4-bit sub-scales): measured 0.0025 / 0.0148
++constexpr float MAX_QUANTIZATION_TOTAL_ERROR_Q2_0 = 0.005f;
++constexpr float MAX_DOT_PRODUCT_ERROR_Q2_0 = 0.03f;
+ 
+ static const char* RESULT_STR[] = {"ok", "FAILED"};
+ 
+@@ -158,7 +163,7 @@ static int test_vec_dot_q(bool verbose) {
+                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+-                type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
++                type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_Q2_0 :
+                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+@@ -184,7 +189,9 @@ static int test_vec_dot_q(bool verbose) {
+                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
+                 : type == GGML_TYPE_Q1_0
+                 ? MAX_DOT_PRODUCT_ERROR_BINARY
+-                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
++                : type == GGML_TYPE_Q2_0
++                ? MAX_DOT_PRODUCT_ERROR_Q2_0
++                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
+                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
+                 : type == GGML_TYPE_NVFP4
+                 ? MAX_DOT_PRODUCT_ERROR_FP4
+@@ -200,6 +207,65 @@ static int test_vec_dot_q(bool verbose) {
+     return num_failed;
+ }
+ 
++// Q2_0 dot product on random block bytes (random sub-block scales and indices) against a double precision reference
++// computed from the dequantized values. The generic quantizer only produces a narrow range of scale nibbles, so this
++// is what catches a wrong sub-block multiplier or index decode in an arch specific kernel.
++static int test_vec_dot_q2_0_random_blocks(bool verbose) {
++    const auto * q2_0_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
++    const auto * q2_0     = ggml_get_type_traits(GGML_TYPE_Q2_0);
++    const auto * q8_0     = ggml_get_type_traits(GGML_TYPE_Q8_0);
++    assert(q2_0_cpu->vec_dot != nullptr && q2_0_cpu->vec_dot_type == GGML_TYPE_Q8_0);
++
++    constexpr float MAX_ERROR = 1e-5f; // error normalised by sum|w*x|; float rounding is about 1e-7
++    std::mt19937 rng(1234);
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++
++    int num_failed = 0;
++    for (int n : {64, 1856, 2688}) {
++        const int nb = n / q2_0->blck_size;
++        std::vector<uint8_t> q2(nb * ggml_type_size(GGML_TYPE_Q2_0));
++        std::vector<uint8_t> q8(n / q8_0->blck_size * ggml_type_size(GGML_TYPE_Q8_0));
++        std::vector<float> act(n), w(n), a(n);
++
++        double worst = 0.0;
++        for (int row = 0; row < 300; row++) {
++            for (size_t i = 0; i < q2.size(); i++) {
++                q2[i] = rng() & 0xFF;
++            }
++            // the first 2 bytes of each block are the fp16 scale: replace them with a sane value
++            for (int b = 0; b < nb; b++) {
++                const ggml_fp16_t d = ggml_fp32_to_fp16(0.001f * (1 + rng() % 100));
++                memcpy(&q2[b * ggml_type_size(GGML_TYPE_Q2_0)], &d, sizeof(d));
++            }
++            for (auto & v : act) {
++                v = nd(rng) * (1 + (row % 5));
++            }
++            q8_0->from_float_ref(act.data(), q8.data(), n);
++            q2_0->to_float(q2.data(), w.data(), n);
++            q8_0->to_float(q8.data(), a.data(), n);
++
++            double ref = 0.0, abs_ref = 0.0;
++            for (int i = 0; i < n; i++) {
++                ref     += (double) w[i] * a[i];
++                abs_ref += fabs((double) w[i] * a[i]);
++            }
++            float result = INFINITY;
++            q2_0_cpu->vec_dot(n, &result, 0, q2.data(), 0, q8.data(), 0, 1);
++            const double err = fabs(result - ref) / abs_ref;
++            if (!(err <= worst)) {
++                worst = err;
++            }
++        }
++
++        const bool failed = !(worst < MAX_ERROR);
++        num_failed += failed;
++        if (failed || verbose) {
++            printf(" q2_0 vec_dot random blocks n=%4d:  %s (max normalised error %g)\n", n, RESULT_STR[failed], worst);
++        }
++    }
++    return num_failed;
++}
++
+ int main(int argc, char * argv[]) {
+     bool verbose = false;
+ 
+@@ -221,6 +287,7 @@ int main(int argc, char * argv[]) {
+ 
+     num_failed += test_vec_dot_f32(verbose);
+     num_failed += test_vec_dot_q(verbose);
++    num_failed += test_vec_dot_q2_0_random_blocks(verbose);
+ 
+     if (num_failed || verbose) {
+         printf("%d tests failed\n", num_failed);
