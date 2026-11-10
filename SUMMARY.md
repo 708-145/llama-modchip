@@ -27,7 +27,89 @@ Yes. `llama-modchip` ships with:
 - Manual CMake build instructions documented in README ("Repository Structure & Manual CMake Build Instructions").
 - Patched `llama-quantize` binary supports writing `Q2_0` Fractal-64 blocks (run `./modchip setup --skip-model` first or pass `--quantize-bin /path/to/patched/llama-quantize`).
 
-It runs **offline on CPU** (no CUDA/GPU needed); heavy lifting is custom SIMD kernels (AVX-512BW, AVX2) and cache-aware scheduling. For Windows there is a hybrid GPU+CPU pack (`windows/README.md`); Apple Silicon has Metal/NEON/M4 scripts.
+### Build process (CMake + patched llama.cpp)
+
+`llama-modchip` patches and builds a custom version of `llama.cpp` that includes the Fractal-64 quantizer, Q2_0 CPU optimizations, and Zen 5/Apple Silicon support. The main build script is `scripts/build_zen5_llama.sh`. Here's the step-by-step workflow:
+
+1. **Clone/check out llama.cpp**  
+   The script clones `https://github.com/ggml-org/llama.cpp.git` or checks out a pinned commit (`d2f83055d6e3b379b5d34c4837122a918cf402c2`) into a local directory (`LLAMA_DIR`).
+
+2. **Apply stacked patches** (in file-name order) from `patches/`  
+   - **Main patch**: `zen5-nemotron-256k-optimizations.patch` — the core set of optimizations (Q2_0 Metal decode kernel, gguf-py block size, Q2_0 tests, Fractal-64 quantization, dynamic MoE Top-K, L2-quadrature tail pruning, RouteCrack speculative decoding).  
+   - **Series patches** (Apple Silicon only by default, controllable via `APPLE_SILICON_PATCHES` env var): patches in `patches/nemotron-apple-silicon/` (Q2_0 tests, Metal SDOT, gguf-py Q2_0 block size).  
+   - **Additional CPU patches**: `dsv4-64gb-cpu.patch`, `deepseek-v4-flash-fractal-256k.patch` (Fractal-64 quantization for DeepSeek-V4-Flash 284B).  
+   - Patches are stacked; each subsequent patch changes lines the previous one added, so the tree is checked for consistency after application.
+
+3. **Configure with CMake** using `CMAKE_ISA_ARGS` that detect and enable the appropriate SIMD ISA extensions:  
+   - **AVX-512** (Zen 4/5 or Intel Xeon): `-DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_BF16=ON`  
+   - **AVX2** (Zen 2/3 or Intel): `-DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON`  
+   - **Metal** (Apple Silicon): `-DGGML_METAL=ON` for Metal GPU backend + Metal SDOT kernels  
+   - **ARM64 NEON**: `-DGGML_OPENMP=ON` for NEON SDOT 1x{8,4,3,2} Fractal-64 kernels  
+   - **CUDA/Vulkan**: optional GPU backends (`-DGGML_CUDA`, `-DGGML_VULKAN`)  
+   - **OpenMP**: `-DGGML_OPENMP=ON` for multi-threaded CPU execution  
+
+4. **Build** with `cmake --build` using `Release` configuration and `NPROC` parallelism (number of CPU cores). Build targets: `llama-server`, `llama-quantize`, `llama-bench` (and `test-quantize-fns`, `test-backend-ops` if `BUILD_TESTS=1`).
+
+5. **Result** — A custom `llama.cpp` binary that includes:  
+   - **Fractal-64 (Q2_0) quantizer**: custom 30-byte block-64 quantizer for MoE weight superblocks, enabling 3.75 bpw instead of 4.25 bpw for Q4_0.  
+   - **Dynamic MoE expert selection**: `LLAMA_MOE_TOP_K` env var (default Top-6 + 1 shared expert) to skip inactive experts per layer.  
+   - **L2-quadrature MoE tail pruning**: preserves expert balance using quadratic norm rescaling instead of linear sum.  
+   - **RouteCrack draftless speculative decoding**: predicts tokens without full forward pass, only computing necessary up/down projections.  
+   - **Efficient AVX-512/AVX2 kernels**: tile GEMM, non-temporal prefetch `_MM_HINT_NTA`, token-to-core L1D/L2 affinity, 8-slot Q8_K activation cache.  
+   - **Q2_0 fused kernel** (`ggml_vec_dot_q2_0_q8_0_generic`): unpacks 64 3-bit indices and translates via `_mm256_shuffle_epi8` in 1 cycle, multiplies sub-blocks by integer scales inside `vpmaddwd` at zero extra SIMD cost.
+
+### Building the Fractal-64 quantized GGUF
+
+Separate from the llama.cpp build, `scripts/build_fractal_moe_gguf.sh` asymmetricly dyadic-fractal-quantizes a GGUF model:
+
+- **Input**: a base GGUF (e.g., Nemotron-3.5-30B-A3B BF16/F16 at 17.59 GiB, or DeepSeek-V4-Flash-0731 IQ1_S).  
+- **Output**: Fractal-64 quantized model at 14.35 GiB (Nemotron) or 56.56 GiB (DeepSeek-V4).  
+- **Profiles**:  
+  - `fractal64`: routed experts → Block-64 2-Level Fractal (Q2_0, 30 bytes / 64 weights = 3.75 bpw). SSM & shared experts → Q4_0; GQA attn/head → Q8_0.  
+  - `mxfp4`: routed experts → Dyadic MXFP4 (4.25 bpw); SSM & shared → Q4_0; attn/head → Q8_0.  
+- **Requirements**: patched `llama-quantize` binary (auto-downloaded via `./modchip setup --skip-model` or passed via `--quantize-bin`). An `imatrix` file may be needed for best results.  
+- **Quality gate**: 100/100 on tool-calling, needle retrieval, long-context math (benchmarks/FRACTAL_MOE_QUALITY_GATE.md).
+
+### Quick start
+
+```bash
+# 1. Build llama.cpp with all optimizations
+./scripts/build_zen5_llama.sh    # auto-detects CPU, applies patches, cmake + make
+
+# 2. (Optional) Build a Fractal-64 quantized GGUF
+./scripts/build_fractal_moe_gguf.sh \
+    --input /path/to/input-model.gguf \
+    --output /path/to/output-fractal-moe.gguf \
+    --profile fractal64 \
+    --threads 16
+```bash
+# 1. Build llama.cpp with all optimizations
+./scripts/build_zen5_llama.sh    # auto-detects CPU, applies patches, cmake + make
+
+# 2. (Optional) Build a Fractal-64 quantized GGUF
+./scripts/build_fractal_moe_gguf.sh \\
+    --input /path/to/input-model.gguf \\
+    --output /path/to/output-fractal-moe.gguf \\
+    --profile fractal64 \\
+    --threads 16
+```
+
+### Clarification: Top-K MoE, Tail Pruning, Dynamic Expert Selection (NOT Partial Tensor Processing)
+
+The terms **Top-K MoE**, **Tail Pruning**, and **Dynamic Expert Selection** in llama-modchip do **NOT** mean partial up/down projection or partial tensor computation. They refer to **complete-expert selection and correction**:
+
+- **Top-K MoE (`LLAMA_MOE_TOP_K`)**: Selects a complete set of K *entire* experts per layer. If K = 4, the engine computes **all the activations of exactly those 4 expert projection matrices** (`up_exps`, `gate_exps`, `down_exps`) for each token. The other 2 routed experts are **omitted entirely** from the forward pass.
+
+- **Dynamic Expert Selection**: The K experts are chosen **per token** (or per layer) based on the router's logits, but once selected the computation for those experts proceeds **to completion** — there is no "partial" computation on the selected experts.
+
+- **L2-quadrature Tail Pruning**: After the K selected experts have been fully computed, their output vectors (each `d`-dimensional) are **rescaled using the L2-norm** (`α_L2 = sqrt( Σᵢ wᵢ² / Σᵢ wᵢ² )`) to preserve the exact L2 norm of the full expert ensemble. This is a **post-hoc scaling correction**, not a reduction in the amount of computation for the selected experts.
+
+- **CSA/LID Skip (`GGML_TENSOR_FLAG_DSV4_SKIP`)**: The CSA/LID compressor nodes that implement Sinkhorn-20 hyper-connections are tagged as "skip" on 7/8 decode steps, **eliminating whole-graph rebuilds** rather than partially computing graph nodes.
+
+These mechanisms **avoid computing the other (non-selected) experts altogether** and **reconstruct the missing contribution mathematically** (L2-quadrature scaling) so that the final output is **numerically equivalent** to processing all experts, while delivering **significant speedups** by cutting both compute and DRAM traffic.
+
+Thus, llama-modchip's MoE optimization is **expert-selection-plus-correction**, not **partial tensor processing**.
+```
 
 ## Fractal 64 (Q2_0) quant type - how it works
 
@@ -52,6 +134,8 @@ A third level adds a **non-linear dyadic codebook** `{-14, -8, -4, -1, +1, +4, +
 - Decode **+33.5% (MXFP4) / +28.0% (Fractal-64)** vs Baseline-Q4_0.
 
 Used for **DeepSeek-V4-Flash 284B** (routed experts -> Fractal-64) and **Nemotron-3.5-30B-A3B** (routed experts -> Fractal-64).
+
+**Note on lineage:** `Fractal-64` is an **IQ4_NL-family quantizer** — two-level hierarchical non-linear scaling (FP16 master scale per 64-weight super-block + per-sub-block integer scales) decoded through an **8-value non-linear LUT** (`{-14,-8,-4,-1,+1,+4,+8,+14}`). The specific twist is **8-weight sub-blocks** (8×8 micro-grid) with **shifted 4-bit sub-scales** (`mult ∈ {4..19}`) fused inside AVX2 `vpmaddwd` at zero extra SIMD cost, giving **3.75 bpw** where stock `Q3_K`/`IQ3_S`/`IQ3_XXS` (256-block K-quants) fall back to `Q4_0` on Nemotron's `1856 × 2688` expert dims.
 
 ## Quick links
 - Overview: `README.md`
