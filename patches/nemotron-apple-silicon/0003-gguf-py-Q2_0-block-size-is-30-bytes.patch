@@ -1,0 +1,31 @@
+Subject: [PATCH 3/3] gguf-py: Q2_0 block size is 30 bytes
+
+GGMLQuantizationType.Q2_0 was registered as (64, 2 + 16), the old
+18-byte block. The current Q2_0 block is 30 bytes: fp16 d (2), 4 bytes
+of 4-bit sub-block scales, 16 bytes of low bits and 8 bytes of high bits
+for 64 weights. gguf-py derives tensor byte sizes from this table, so
+reading or writing Q2_0 tensors would mis-size them. Use
+(64, 2 + 4 + 16 + 8).
+
+Checked by reading the table against block_q2_0 in ggml-common.h
+(sizeof == 30, static_assert). Not run: numpy is not available in the
+test environment.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ gguf-py/gguf/constants.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 8d0cad5..8688705 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -5227,7 +5227,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
+     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+-    GGMLQuantizationType.Q2_0:    (64, 2 + 16),
++    GGMLQuantizationType.Q2_0:    (64, 2 + 4 + 16 + 8),
+ }
+ 
+ 
