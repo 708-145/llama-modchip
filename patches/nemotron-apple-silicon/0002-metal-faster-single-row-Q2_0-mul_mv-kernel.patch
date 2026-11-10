@@ -1,0 +1,163 @@
+Subject: [PATCH 2/3] metal: faster single-row Q2_0 mul_mv kernel
+
+kernel_mul_mv_q2_0_f32 gives each thread 16 consecutive weights of a
+block and reads the qs, qh and scales bytes of the block one at a time
+for every weight, with the codebook in a constant array. That makes
+single-token decode (n = 1) slow.
+
+Four threads now share one 64-weight block; thread t handles weights
+16*g + 4*t + c, so every byte of qs, qh and scales is loaded by exactly
+one thread, as 16-bit words, and the 3-bit indices are extracted for
+four weights at once with 32-bit shifts and masks. The codebook is
+looked up from two packed 32-bit constants with a signed extract_bits()
+and the activations are kept in registers as float4. N_R0_Q2_0 goes
+from 8 to 4 rows per simdgroup. Like the other mul_mv kernels it reads
+src1 as float4, so it assumes a 16-byte aligned, contiguous F32 src1 row
+(the row stride is a multiple of 256 bytes when ne10 is a multiple of
+64). Only kernel_mul_mv_q2_0_f32 and the _id variant that wraps it
+change; the dequantizers, mul_mv_ext (n = 2..8) and mul_mm paths are
+untouched.
+
+Measured on an M1 Max, median of 3 runs of
+  test-backend-ops perf -b MTL0 -o MUL_MAT,MUL_MAT_ID -p type_a=q2_0
+(us per run, before -> after):
+  MUL_MAT m=2688 n=1 k=2688                  137.7 ->  52.8
+  MUL_MAT m=8192 n=1 k=2688                  290.1 -> 143.9
+  MUL_MAT m=4096 n=1 k=14336                 655.9 -> 333.2
+  MUL_MAT_ID 128 experts, 6 used, n=1, 1856x2688   386.6 -> 196.0
+  MUL_MAT_ID 128 experts, 6 used, n=1, 2688x1856   395.2 -> 191.5
+  MUL_MAT m=2688 k=2688 n=2,3,4,5,8,512: 76.1/85.0/89.7/100.8/161.6/
+  1635.0 -> 75.3/85.2/90.1/101.0/161.4/1626.4 (no change)
+With N_R0_Q2_0 = 8 and the new kernel, m=2688 n=1 takes 68.9 us, so 4
+is kept. In the 'before' set one of the 3 runs was 1.7-1.9x slower on every
+case; the medians are not affected. All 'after' runs agree within 1%.
+
+test-backend-ops -b MTL0 -p q2_0 passes 202/202 with the tests commit
+before this one (188 cases with quantizer-made blocks, including m=257
+so the row count is not a multiple of the 4 rows per simdgroup or the 8
+per threadgroup, and 14 cases with random raw blocks). Changing
+hb = t >> 1 to hb = t & 1 in the new kernel leaves 84 of the 202
+passing (exit 1).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-impl.h |  2 +-
+ ggml/src/ggml-metal/ggml-metal.metal  | 71 ++++++++++++++++-----------
+ 2 files changed, 42 insertions(+), 31 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index e173b91..cf15518 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -24,7 +24,7 @@
+ #define N_R0_Q1_0 8
+ #define N_SG_Q1_0 2
+ 
+-#define N_R0_Q2_0 8
++#define N_R0_Q2_0 4
+ #define N_SG_Q2_0 2
+ 
+ #define N_R0_Q4_0 4
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index f72804e..e2392b3 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -3469,31 +3469,45 @@ inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thre
+     return qb_curr->d * (2.0f * acc - sumy);
+ }
+ 
+-// Q2_0 (Fractal-64) dot: 16-weight group g = il / 16 across two 8-weight sub-blocks (2*g, 2*g + 1)
+-inline float block_q_n_dot_y(device const block_q2_0 * qb_curr, float sumy, thread float * yl, int il) {
+-    (void)sumy;
+-    const int   g        = il >> 4;
+-    const int   shift_lo = 2 * g;
+-    const int   s_idx    = (g & 1) * 2;
+-    const int   s_shift  = (g >> 1) * 4;
+-    const float m_lo     = (float)(4u + ((uint(qb_curr->scales[s_idx + 0]) >> s_shift) & 0x0Fu));
+-    const float m_hi     = (float)(4u + ((uint(qb_curr->scales[s_idx + 1]) >> s_shift) & 0x0Fu));
++// Q2_0 decode-path dot: 4 threads cooperate on one 64-weight block (thread t handles k = 4t..4t+3 of every group g,
++// i.e. weights 16*g + 4*t + c, so each byte of qs/qh/scales is loaded by exactly one thread, as 16-bit words).
++// The codebook {-14,-8,-4,-1,1,4,8,14} is looked up from two packed 32-bit constants with a signed bit-field extract
++// (no memory LUT, no dynamic indexing of constant arrays).
++inline float q2_0_cb(uint idx) {
++    const uint w = (idx & 4) ? 0x0E080401u : 0xFFFCF8F2u;
++    return (float) extract_bits((int) w, (idx & 3) * 8, 8);
++}
+ 
+-    float acc_lo = 0.0f;
+-    float acc_hi = 0.0f;
++inline float q2_0_dot_thread(device const block_q2_0 * qb, thread const float4 * y4, short t) {
++    device const ushort * qs16 = (device const ushort *) qb->qs     + 2*t;
++    device const ushort * qh16 = (device const ushort *) qb->qh     + ((2*t) & 3);
++    device const ushort * sc16 = (device const ushort *) qb->scales;
+ 
+-    FOR_UNROLL (int k = 0; k < 8; ++k) {
+-        const uint qh_b  = qb_curr->qh[k];
+-        const uint lo2_0 = (uint(qb_curr->qs[k]) >> shift_lo) & 0x03u;
+-        const uint hi1_0 = (qh_b >> shift_lo) & 0x01u;
+-        acc_lo += yl[k] * fractal3_val(lo2_0, hi1_0);
++    const uint Q = (uint) qs16[0] | ((uint) qs16[1] << 16);
++    const uint H = (uint) qh16[0] | ((uint) qh16[1] << 16);
++    const uint S = (uint) sc16[0] | ((uint) sc16[1] << 16);
+ 
+-        const uint lo2_1 = (uint(qb_curr->qs[k + 8]) >> shift_lo) & 0x03u;
+-        const uint hi1_1 = (qh_b >> (shift_lo + 1)) & 0x01u;
+-        acc_hi += yl[k + 8] * fractal3_val(lo2_1, hi1_1);
++    const short hb = t >> 1; // k >> 3 for this thread's k range
++
++    float acc = 0.0f;
++
++    FOR_UNROLL (short g = 0; g < 4; g++) {
++        const uint ix = ((Q >> (2*g)) & 0x03030303u) | (((H >> (2*g + hb)) & 0x01010101u) << 2);
++
++        const float4 yv = y4[g];
++        const float sg = q2_0_cb( ix        & 7) * yv[0] +
++                         q2_0_cb((ix >>  8) & 7) * yv[1] +
++                         q2_0_cb((ix >> 16) & 7) * yv[2] +
++                         q2_0_cb((ix >> 24)    ) * yv[3];
++
++        // sub-block b = 2g + hb: b < 4 -> low nibble of scales[b], else high nibble of scales[b-4]
++        const short b   = 2*g + hb;
++        const uint  nib = (g < 2) ? ((S >> (8*b)) & 0x0F) : ((S >> (8*(b - 4) + 4)) & 0x0F);
++
++        acc += (float)(4 + nib) * sg;
+     }
+ 
+-    return (float)qb_curr->d * (acc_lo * m_lo + acc_hi * m_hi);
++    return (float) qb->d * acc;
+ }
+ 
+ // function for calculate inner product between half a q4_0 block and 16 floats (yl), sumy is SUM(yl[i])
+@@ -3832,25 +3846,22 @@ void kernel_mul_mv_q2_0_f32_impl(
+         ax[row] = (device const block_q2_0 *) ((device char *) src0 + offset0);
+     }
+ 
+-    float yl[16];
++    float4 y4[4];
+     float sumf[nr0] = {0.f};
+ 
+-    // group 64: 4 sub-blocks of 16 weights per Q2_0 block
++    // 4 threads per 64-weight block, 8 blocks in flight per simdgroup
+     const short ix = (tiisg/4);
+-    const short il = (tiisg%4)*16;
++    const short it = (tiisg%4);
+ 
+-    device const float * yb = y + ix*QK2_0 + il;
++    device const float * yb = y + ix*QK2_0 + 4*it;
+ 
+     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/4) {
+-        float sumy = 0.f;
+-
+-        FOR_UNROLL (short i = 0; i < 16; i++) {
+-            yl[i] = yb[i];
+-            sumy += yb[i];
++        FOR_UNROLL (short g = 0; g < 4; g++) {
++            y4[g] = *((device const float4 *)(yb + 16*g));
+         }
+ 
+         FOR_UNROLL (short row = 0; row < nr0; row++) {
+-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
++            sumf[row] += q2_0_dot_thread(ax[row] + ib, y4, it);
+         }
+ 
+         yb += QK2_0 * (N_SIMDWIDTH/4);
