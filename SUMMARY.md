@@ -237,4 +237,82 @@ This is **not** a weight-selection or pruning technique. It's a **graph-executio
 
 ---
 
+## RouteCrack + Stockfish-PVS: Draftless Speculative Decoding
+
+### What Is It?
+
+**RouteCrack + Stockfish-PVS** is llama-modchip's **primary speculative decoding engine** — a **draftless** (no separate draft model) approach that uses **batch verification** to generate multiple tokens per forward pass. Unlike classic MTP (which requires a separate draft model), RouteCrack uses the **existing main model** with a lightweight **statistical predictor** that proposes candidate tokens, which are then verified in a single batch forward pass.
+
+### How It Works
+
+**1. RouteCrack Prediction (Draft Generation)**
+- **8-Level FNV-64 Cascade**: A hash-based predictor that analyzes the current context and proposes multiple candidate tokens
+- **11,382-Entry Multi-Token Macro Codebook**: Pre-computed token sequences for common patterns (96.44% precision)
+- **Stockfish-PVS Transposition Tables**: 192 KB L2-resident Zobrist hash tables (`tt5/tt4/tt3`) that cache promising token sequences
+- **RouteCrack** = the routing/prediction engine that decides which tokens to propose
+
+**2. Stockfish-PVS (Principal Variation Search)**
+- **1-Ply Quiescence PVS**: Evaluates candidate token sequences with 1-ply lookahead
+- **Singular Horizon Extension** (`M=7`): Extends search when `true_consensus_hits == d` (high confidence)
+- **Refutation Tracking**: Tracks which token sequences fail, avoiding repeated failures
+- **Stockfish History Gravity**: `h += bonus - h * |bonus| / 512` — prioritizes historically successful token sequences
+
+**3. Batch Verification**
+- **Multiple tokens proposed** (typically 3-7 per step)
+- **Single forward pass** verifies all proposed tokens simultaneously
+- **Tokens accepted** if they match the model's predictions
+- **Tokens rejected** → rollback to last accepted position, continue from there
+
+### Key Performance Characteristics
+
+| Metric | Value |
+|---|---|
+| Draft acceptance rate | **96.39%** (best case), **59-66%** (typical) |
+| Mean speculative length | **4.18-6.90 tok/step** |
+| Decode throughput (16C Zen 5) | **48.39 tok/s avg / 60.40 tok/s peak** |
+| Decode throughput (Threadripper 7985WX) | **111.62 tok/s warm** |
+| Prefill throughput | **386.00 tok/s** (Threadripper) |
+
+### RouteCrack + Stockfish-PVS vs. Classic MTP
+
+| Aspect | RouteCrack + Stockfish-PVS | Classic MTP |
+|---|---|---|
+| **Draft model** | None (uses existing main model) | Separate MTP head (~1.16 GB) |
+| **Verification** | Batch forward pass (single model) | Separate MTP model forward pass |
+| **Memory overhead** | 192 KB (TT tables only) | ~1.16 GB (MTP model) |
+| **Best for** | CPU inference (no extra model needed) | GPU scenarios with VRAM to spare |
+| **Acceptance rate** | 59-96% | Varies by model quality |
+
+### Is There Partial Execution / Neuron Skipping in Up/Down Projections?
+
+**No.** RouteCrack + Stockfish-PVS does **NOT** perform partial execution or neuron skipping in the up/down projections. Here's the distinction:
+
+**What RouteCrack does:**
+- Proposes **candidate token sequences** using statistical prediction
+- Verifies **entire token sequences** in a single batch forward pass
+- **Each token** goes through **complete** up/down projections (all experts, all layers)
+- **No neurons are skipped** — the full model computes for each proposed token
+
+**What it does NOT do:**
+- **No partial up-projection**: The `up_exps` matrix is fully computed for each token
+- **No partial down-projection**: The `down_exps` matrix is fully computed for each token
+- **No neuron skipping**: All neurons in the FFN layers are computed
+- **No weight pruning**: All expert weights are loaded and used
+
+**The "speculation" is at the token level, not the neuron level:**
+- RouteCrack predicts **which tokens** to generate
+- The main model **fully computes** each proposed token
+- If a token is accepted, its computation was "wasted" (but amortized across multiple tokens)
+- If a token is rejected, the model rolls back and tries a different token
+
+### Bottom Line
+
+RouteCrack + Stockfish-PVS is a **token-level speculative decoding** technique that:
+- Uses **statistical prediction** (not a separate draft model)
+- Verifies **entire token sequences** in batch forward passes
+- Achieves **48-112 tok/s** decode on CPU
+- Does **NOT** perform partial execution or neuron skipping — each proposed token goes through the **complete** up/down projections
+
+---
+
 *Project: `synchopate/llama-modchip` · Version 2.4.0 · License: Apache 2.0*
