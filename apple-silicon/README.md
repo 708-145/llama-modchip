@@ -6,8 +6,34 @@ build 10809 (`5266f24da`), with `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf
 
 The upstream optimizations are for one AMD Zen 5 CPU without a GPU. On a Mac, the Metal GPU does the
 work, and the memory bandwidth is 273 GB/s (not approximately 75 GB/s). Thus most of the upstream
-changes do not apply, and the limit is the size of the memory, not the bandwidth. Stock llama.cpp is
-sufficient. No patch is necessary.
+changes do not apply, and the limit is the size of the memory, not the bandwidth. For the Q4_0 file
+measured below, stock llama.cpp is sufficient and no patch is necessary. This does not hold for the
+Fractal-64 (`Q2_0`) GGUFs, see the next section.
+
+## Fractal-64 (`Q2_0`) GGUFs
+
+A Fractal-64 GGUF (for example `NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64.gguf`) stores `Q2_0` tensors in a
+30-byte block of 64 weights. Stock llama.cpp sizes `Q2_0` with an 18-byte block and cannot read the file:
+Homebrew llama.cpp (ggml 0.19.0) exits with `gguf_init_from_reader: tensor 'blk.1.ffn_down_shexp.weight' has
+offset 899308800, expected 779574528`. Build the patched engine instead:
+
+```bash
+BUILD_TESTS=1 ./apple-silicon/setup.sh      # BUILD_TESTS=1 also builds test-quantize-fns and test-backend-ops
+```
+
+`scripts/build_zen5_llama.sh` applies `patches/zen5-nemotron-256k-optimizations.patch` and, on macOS, the patches in
+`patches/nemotron-apple-silicon/`: a faster single-row (decode) `Q2_0` Metal kernel (a 4-thread block layout
+plus a 512-byte threadgroup pair-lookup table for the codebook), the `Q2_0` block size in
+`gguf-py`, and tighter `Q2_0` tests (including a random-block dot product test that also covers the armv8.0 NEON
+branch when built with `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a`, and `test-backend-ops` cases with random
+raw `Q2_0` blocks). On other systems these patches are not applied, so a Linux build is unchanged; set
+`APPLE_SILICON_PATCHES=1` to apply them anyway or `=0` to leave them out on a Mac. If an earlier run was interrupted and left only part of the series
+applied, the script stops without changing anything; `RESET_LLAMA_TREE=1` discards the uncommitted changes in the
+llama.cpp clone and applies everything again. The patch files have no mail
+headers: they are meant for `git apply` (as the script does), not `git am`. Check a build, from the llama.cpp
+directory, with `build/bin/test-quantize-fns` and `build/bin/test-backend-ops test -b MTL0 -p q2_0`. These patches
+only change the `Q2_0` Metal kernel, `gguf-py` and the tests; the other backends and CPU architectures were not
+audited. They apply to the Nemotron patch only, not to the DeepSeek-V4 patch stack in `patches/apple-silicon/`.
 
 ## Results
 

@@ -8,6 +8,8 @@ LLAMA_COMMIT="d2f83055d6e3b379b5d34c4837122a918cf402c2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PATCH_FILE="${REPO_ROOT}/patches/zen5-nemotron-256k-optimizations.patch"
+# patches stacked on top of PATCH_FILE, applied in file-name order
+SERIES_DIR="${REPO_ROOT}/patches/nemotron-apple-silicon"
 SPEC_CPP_DIR="${REPO_ROOT}/speculative/cpp"
 OS_NAME="$(uname -s)"
 ARCH_NAME="$(uname -m)"
@@ -32,8 +34,52 @@ else
     fi
 fi
 
+# Patches stacked on top of PATCH_FILE (Q2_0 Metal decode kernel, gguf-py block size, Q2_0 tests). They are applied on
+# macOS by default and left out elsewhere, so a Linux/zen5 source tree is the same as before; APPLE_SILICON_PATCHES=1
+# applies them on any OS, =0 never.
+APPLE_SILICON_PATCHES="${APPLE_SILICON_PATCHES:-auto}"
+if [[ "$APPLE_SILICON_PATCHES" == "auto" ]]; then
+    if [[ "$OS_NAME" == "Darwin" ]]; then APPLE_SILICON_PATCHES=1; else APPLE_SILICON_PATCHES=0; fi
+fi
+SERIES_PATCHES=()
+if [[ "$APPLE_SILICON_PATCHES" == "1" ]]; then
+    shopt -s nullglob
+    SERIES_PATCHES=("${SERIES_DIR}"/[0-9][0-9][0-9][0-9]-*.patch)
+    shopt -u nullglob
+fi
+
+# The stacked patches change lines the base patch added, so once they are applied PATCH_FILE can no longer be checked on
+# its own. Count the series patches that reverse-apply: all of them means PATCH_FILE and the series are in the tree; some
+# of them means an interrupted run: the script stops, or resets the tree to the pinned commit if RESET_LLAMA_TREE=1.
+SERIES_APPLIED=0
+if [[ ${#SERIES_PATCHES[@]} -gt 0 ]]; then
+    N_SERIES_IN_TREE=0
+    for p in "${SERIES_PATCHES[@]}"; do
+        if git -C "$LLAMA_DIR" apply --reverse --check "$p" 2>/dev/null; then
+            N_SERIES_IN_TREE=$((N_SERIES_IN_TREE + 1))
+        fi
+    done
+    if [[ "$N_SERIES_IN_TREE" -eq "${#SERIES_PATCHES[@]}" ]]; then
+        SERIES_APPLIED=1
+    elif [[ "$N_SERIES_IN_TREE" -gt 0 ]]; then
+        # A partly applied series must not be built, and the script cannot tell the patches' changes from the user's own
+        # edits, so it only resets the tree when asked to.
+        if [[ "${RESET_LLAMA_TREE:-0}" == "1" ]]; then
+            echo "[*] Only $N_SERIES_IN_TREE of ${#SERIES_PATCHES[@]} patches from patches/nemotron-apple-silicon/ are in $LLAMA_DIR; RESET_LLAMA_TREE=1: resetting its working tree to clean $LLAMA_COMMIT (uncommitted changes are discarded)..."
+            git -C "$LLAMA_DIR" checkout -- .
+        else
+            echo "[!] ERROR: Only $N_SERIES_IN_TREE of ${#SERIES_PATCHES[@]} patches from patches/nemotron-apple-silicon/ are in $LLAMA_DIR (an interrupted run?)." >&2
+            echo "[!] Nothing was changed. To discard the uncommitted changes in $LLAMA_DIR and apply everything again, run:" >&2
+            echo "[!]   RESET_LLAMA_TREE=1 $0 $LLAMA_DIR     (or: git -C $LLAMA_DIR checkout -- .  and run again)" >&2
+            exit 1
+        fi
+    fi
+fi
+
 echo "[*] Applying 256K Hybrid SWA + Fractal-64 SIMD/Metal + L3 NTA + 2MB HugePages patch..."
-if git -C "$LLAMA_DIR" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+if [[ "$SERIES_APPLIED" == "1" ]]; then
+    echo "[i] Patch and patches/nemotron-apple-silicon/ already applied cleanly in $LLAMA_DIR."
+elif git -C "$LLAMA_DIR" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
     echo "[i] Patch already applied cleanly in $LLAMA_DIR."
 elif git -C "$LLAMA_DIR" apply --check "$PATCH_FILE" 2>/dev/null; then
     git -C "$LLAMA_DIR" apply "$PATCH_FILE"
@@ -55,6 +101,20 @@ cp -f "${SPEC_CPP_DIR}/rc_predictor.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/rc_trie_v2.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/rc_stockfish.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/ngram-map.cpp" "$LLAMA_DIR/common/"
+
+if [[ "$SERIES_APPLIED" != "1" && ${#SERIES_PATCHES[@]} -gt 0 ]]; then
+    echo "[*] Applying patches/nemotron-apple-silicon/ (Q2_0 tests, Metal Q2_0 decode kernel, gguf-py Q2_0 block size)..."
+    for p in "${SERIES_PATCHES[@]}"; do
+        if git -C "$LLAMA_DIR" apply --check "$p"; then
+            git -C "$LLAMA_DIR" apply "$p"
+            echo "[+] Applied $(basename "$p")"
+        else
+            echo "[!] ERROR: Failed to apply $p onto $LLAMA_DIR." >&2
+            echo "[!] $LLAMA_DIR has local changes in the files this patch touches; use a fresh clone of llama.cpp at $LLAMA_COMMIT." >&2
+            exit 1
+        fi
+    done
+fi
 
 CMAKE_ISA_ARGS=(-DGGML_NATIVE="${GGML_NATIVE:-ON}" -DBUILD_SHARED_LIBS=ON)
 
@@ -120,12 +180,19 @@ CMAKE_ISA_ARGS+=(
     -DGGML_CUDA="${CUDA_OPT}"
 )
 
+# BUILD_TESTS=1 (default off) also builds test-quantize-fns and test-backend-ops
+BUILD_TARGETS=(llama-server llama-quantize llama-bench)
+if [[ "${BUILD_TESTS:-0}" == "1" ]]; then
+    CMAKE_ISA_ARGS+=(-DLLAMA_BUILD_TESTS=ON)
+    BUILD_TARGETS+=(test-quantize-fns test-backend-ops)
+fi
+
 echo "[*] Configuring CMake build in ${BUILD_DIR}..."
 cmake -S "$LLAMA_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     "${CMAKE_ISA_ARGS[@]}"
 
-echo "[*] Building llama-server, llama-quantize & llama-bench with ${NPROC} threads..."
-cmake --build "$BUILD_DIR" --config Release -j "${NPROC}" --target llama-server llama-quantize llama-bench
+echo "[*] Building ${BUILD_TARGETS[*]} with ${NPROC} threads..."
+cmake --build "$BUILD_DIR" --config Release -j "${NPROC}" --target "${BUILD_TARGETS[@]}"
 
-echo "[+] Build complete: ${BUILD_DIR}/bin/{llama-server,llama-quantize,llama-bench}"
+echo "[+] Build complete: ${BUILD_DIR}/bin/ (${BUILD_TARGETS[*]})"
