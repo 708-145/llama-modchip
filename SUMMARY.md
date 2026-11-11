@@ -2,9 +2,19 @@
 
 ## Ideas
 
-- use ExpertSelectReducedMantissa global scale: save 1B
-- use 3bit LUT for 4 bit block scale: save 1B
-- overal 28B == 3.5bpw
+- efficient IQ3_NL
+  - use ExpertSelectReducedMantissa global scale: save 1B
+  - use 3bit LUT for 4 bit block scale: save 1B
+  - overal 28B == 3.5bpw
+- efficient IQ3_XS
+- DNA (dynamic neuron activation)
+  - per layer and expert decision how many neurons get computed
+- PRP (per row precision): 
+  - per row decision how to encode
+  - less for decision gate neurons, more for feature neurons
+- LBV (large batch validation) 
+  - stream through weights from RAM
+  - compute huge batch since SIMD compute >> RAM B/W
 
 ## What is llama-modchip?
 
