@@ -118,6 +118,13 @@ The terms **Top-K MoE**, **Tail Pruning**, and **Dynamic Expert Selection** in l
 
 - **Dynamic Expert Selection**: The K experts are chosen **per token** (or per layer) based on the router's logits, but once selected the computation for those experts proceeds **to completion** — there is no "partial" computation on the selected experts.
 
+  **Is the number of computed experts dynamic or fixed?** **Static** The MoE router evaluates the logits for all `expert_count` experts at each layer and selects the top-K per token, where K is fixed. The default `LLAMA_MOE_TOP_K=4` reduces from the original 6 (or 8 with shared experts) to 4, but the **selection itself is dynamic** — a different set of 4 experts may be chosen for each token based on the router's confidence scores. The router jumps "pseudorandomly across the 18.7 GB address space 52 times per token" (DeepSeek-V4-Flash: 128 experts, top-4 selected per token).
+
+  **Default vs. configured values:**
+  - **Default**: `expert_used_count = 8` routed experts per token (`6` routed + `2` shared-equivalent = **8 expert-units active**) by default
+  - **Reduced**: `LLAMA_MOE_TOP_K=4` selects **exactly 4 routed experts** per layer, which already capture `>86%` of the router probability mass (Nemotron 3.5 auditing suite: `9.55/10` standalone, `9.80/10` with cognitive memory)
+  - **Aggressive pruning**: `LLAMA_MOE_TOP_K=2` fails due to directional subspace collapse
+
 - **L2-quadrature Tail Pruning**: After the K selected experts have been fully computed, their output vectors (each `d`-dimensional) are **rescaled using the L2-norm** (`α_L2 = sqrt( Σᵢ wᵢ² / Σᵢ wᵢ² )`) to preserve the exact L2 norm of the full expert ensemble. This is a **post-hoc scaling correction**, not a reduction in the amount of computation for the selected experts.
 
 - **CSA/LID Skip (`GGML_TENSOR_FLAG_DSV4_SKIP`)**: The CSA/LID compressor nodes that implement Sinkhorn-20 hyper-connections are tagged as "skip" on 7/8 decode steps, **eliminating whole-graph rebuilds** rather than partially computing graph nodes.
